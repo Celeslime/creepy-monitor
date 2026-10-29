@@ -1,0 +1,10 @@
+.workbuddy/
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+_probe.json
+_own.json
+_other.json
+_p0.json
+_w.json
