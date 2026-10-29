@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         隔墙有耳 · Creepy Monitor
-// @namespace    https://github.com/Celeslime/Music163-optimizations
+// @namespace    https://github.com/Celeslime/creepy-monitor
 // @version      3.2.0
 // @description  在用户主页「听歌排行」里补上播放次数：格点反解，并靠周榜差分维护每人每天的听歌增量
 // @author       Cele
 // @match        https://music.163.com/*
 // @icon         https://s1.music.126.net/style/favicon.ico?v20180823
-// @homepageURL  https://github.com/Celeslime/Music163-optimizations
-// @supportURL   https://github.com/Celeslime/Music163-optimizations/issues
+// @homepageURL  https://github.com/Celeslime/creepy-monitor
+// @supportURL   https://github.com/Celeslime/creepy-monitor/issues
 // @run-at       document-idle
 // @grant        none
 // @noframes

@@ -25,7 +25,7 @@
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge）或 Violentmonkey（Firefox）
-2. 新建脚本，把 [`creepy-monitor.user.js`](./creepy-monitor.user.js) 全部内容粘进去保存
+2. 点这个链接一键安装：[**creepy-monitor.user.js**](https://raw.githubusercontent.com/Celeslime/creepy-monitor/master/creepy-monitor.user.js)，脚本管理器会直接弹出安装页；或新建脚本，把文件内容全部粘进去保存
 3. 打开任意用户主页，例如 `https://music.163.com/#/user/home?id=xxxxxxx`，切到「听歌排行」
 
 需要登录态。未登录时接口仍返回数据，但「本人真实次数」不可用。
