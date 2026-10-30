@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         隔墙有耳 · Creepy Monitor
-// @namespace    https://github.com/Celeslime/creepy-monitor
-// @version      3.2.0
-// @description  在用户主页「听歌排行」里补上播放次数：格点反解，并靠周榜差分维护每人每天的听歌增量
-// @author       Cele
-// @match        https://music.163.com/*
-// @icon         https://s1.music.126.net/style/favicon.ico?v20180823
-// @homepageURL  https://github.com/Celeslime/creepy-monitor
-// @supportURL   https://github.com/Celeslime/creepy-monitor/issues
-// @run-at       document-idle
-// @grant        none
+// @name 隔墙有耳 · Creepy Monitor
+// @namespace https://github.com/Celeslime/creepy-monitor
+// @version 3.2.1
+// @description 在用户主页「听歌排行」里补上播放次数：格点反解，并靠周榜差分维护每人每天的听歌增量
+// @author Cele
+// @match https://music.163.com/*
+// @icon https://s1.music.126.net/style/favicon.ico?v20180823
+// @homepageURL https://github.com/Celeslime/creepy-monitor
+// @supportURL https://github.com/Celeslime/creepy-monitor/issues
+// @run-at document-idle
+// @grant none
 // @noframes
 // ==/UserScript==
 
@@ -17,15 +17,16 @@
     'use strict';
 
     const CFG = {
-        // auto    默认：格点能唯一确定标尺时显示次数，饱和时显示占比
-        // count   总是显示反解值（饱和时显示 ≥N次）
+        // auto 默认：格点能唯一确定标尺时显示次数，饱和时显示占比
+        // count 总是显示反解值（饱和时显示 ≥N次）
         // percent 总是显示占比
         MODE: 'auto',
-        DAILY: true,             // 是否记录 / 显示今日增量
-        ASSUME_TOP_COUNT: 0,     // 0 = 不用人为标尺
-        REFRESH_MS: 800,
+        DAILY: true, // 是否记录 / 显示今日增量
+        ASSUME_TOP_COUNT: 0, // 0 = 不用人为标尺
+        BOOT_MS: 200, // 首次注入前的轮询间隔，抢时间
+        REFRESH_MS: 600, // 注入成功后的轮询间隔，只用来跟 tab 切换
         CACHE_MS: 60 * 1000,
-        MAX_USERS: 60,           // 日增量记录的人数上限（超出按最久未访问淘汰）
+        MAX_USERS: 60, // 日增量记录的人数上限（超出按最久未访问淘汰）
         DEBUG: false,
     };
 
@@ -66,29 +67,29 @@
     function applyObservation(u, today, W) {
         if (!u.days) u.days = {};
 
-        if (!u.cur) {                       // 首次：只存基线，没有差值可算
+        if (!u.cur) { // 首次：只存基线，没有差值可算
             u.cur = { day: today, counts: W };
             return null;
         }
 
         let gap = 0;
-        if (u.cur.day !== today) {          // 跨天：把上一份快照固化为基线
+        if (u.cur.day !== today) { // 跨天：把上一份快照固化为基线
             gap = daysBetween(u.cur.day, today);
             if (gap !== 1) u.dirty = today; // 漏访会在 7 天内污染差分链条
             u.base = u.cur;
             u.cur = { day: today, counts: W };
-        } else {                            // 同一天重复访问：只刷新当日快照
+        } else { // 同一天重复访问：只刷新当日快照
             u.cur.counts = W;
         }
 
         if (!u.base) return null;
 
-        const comp = u.days[shiftDay(today, -7)] || null;   // 7 天前的日增量
+        const comp = u.days[shiftDay(today, -7)] || null; // 7 天前的日增量
         const counts = {};
         const ids = new Set([...Object.keys(W), ...Object.keys(u.base.counts)]);
         for (const id of ids) {
             const d = (W[id] || 0) - (u.base.counts[id] || 0) + (comp ? (comp[id] || 0) : 0);
-            counts[id] = Math.max(0, d);    // 掉出榜单导致的负值钳到 0
+            counts[id] = Math.max(0, d); // 掉出榜单导致的负值钳到 0
         }
 
         u.days[today] = counts;
@@ -123,6 +124,7 @@
     /* ---------------- 接口层 ---------------- */
 
     const cache = new Map(); // uid -> { t, week, all }
+    const inflight = new Map(); // uid -> Promise，避免同一个 uid 重复请求
 
     function fetchRecord(uid, type) {
         return fetch(`/api/v1/play/record?uid=${uid}&type=${type}`, { credentials: 'include' })
@@ -149,11 +151,17 @@
     async function loadData(uid) {
         const hit = cache.get(uid);
         if (hit && Date.now() - hit.t < CFG.CACHE_MS) return hit;
+        if (inflight.has(uid)) return inflight.get(uid); // 预取和注入撞在一起时只发一次请求
 
-        const [week, all] = await Promise.all([fetchRecord(uid, 1), fetchRecord(uid, 0)]);
-        const data = { t: Date.now(), week: buildDataset(week, 'weekData'), all: buildDataset(all, 'allData') };
-        if (data.week.map.size || data.all.map.size) cache.set(uid, data);
-        return data;
+        const p = (async () => {
+            const [week, all] = await Promise.all([fetchRecord(uid, 1), fetchRecord(uid, 0)]);
+            const data = { t: Date.now(), week: buildDataset(week, 'weekData'), all: buildDataset(all, 'allData') };
+            if (data.week.map.size || data.all.map.size) cache.set(uid, data);
+            return data;
+        })();
+
+        inflight.set(uid, p);
+        try { return await p; } finally { inflight.delete(uid); }
     }
 
     /* ---------------- 存储 ---------------- */
@@ -174,7 +182,7 @@
     // 用周榜反解出「本周每首歌的次数」，再交给 applyObservation 做差分
     function recordDaily(uid, weekDs) {
         if (!CFG.DAILY || !weekDs || !weekDs.scale) return null;
-        if (weekDs.scale.M >= SATURATION) return null;   // 周榜标尺饱和，次数不可靠，不记录
+        if (weekDs.scale.M >= SATURATION) return null; // 周榜标尺饱和，次数不可靠，不记录
 
         const W = {};
         for (const [id, info] of weekDs.map) {
@@ -212,14 +220,19 @@
         return null;
     }
 
+    const pickUid = s => {
+        const m = s && /[?&]id=(\d+)/.exec(s);
+        return m ? m[1] : null;
+    };
+
+    // 不依赖 DOM 的 uid：列表还没渲染时也能先把数据抓回来。
+    // 只认 #/user/ 开头的路由，#/song?id= / #/playlist?id= 也带 id，别拿去请求听歌排行
+    const hashUid = () => (/\/user(\/|\?|$)/.test(location.hash || '') ? pickUid(location.hash) : null);
+
     function getUid(doc) {
-        const pick = s => {
-            const m = s && /[?&]id=(\d+)/.exec(s);
-            return m ? m[1] : null;
-        };
-        return pick(doc.location && doc.location.search)
-            || pick(doc.location && doc.location.hash)
-            || pick(location.hash)
+        return pickUid(doc.location && doc.location.search)
+            || pickUid(doc.location && doc.location.hash)
+            || hashUid()
             || null;
     }
 
@@ -253,9 +266,11 @@
 
         if (day && day.counts) {
             const n = day.counts[info.id] || 0;
-            if (n > 0) r.text += ` +${n}`;
+            const note = day.exact ? '' : '，含窗口滑出的估算误差';
+            r.deltaTip = `今日新增 ${n} 次（${day.time} 观测）${note}`;
             if (day.warm) r.tip += '；今日增量首个观测日，明日开始统计';
-            else r.tip += `；今日新增 ${n} 次（${day.time} 观测）` + (day.exact ? '' : '，含窗口滑出的估算误差');
+            else if (n > 0) r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
+            else r.tip += `；${r.deltaTip}`;
         }
         return r;
     }
@@ -295,19 +310,47 @@
             if (!info) continue;
             hit++;
 
-            const official = tops.querySelector('.times');
-            if (official && !official.classList.contains('tm-times')) continue;
+            // 官方已显示次数的行（本人主页）复用它的节点，数字不重复写，只往里挂增量
+            const official = tops.querySelector('.times:not(.tm-times):not(.tm-delta)');
+            if (official) {
+                const stale = tops.querySelector('.tm-times');
+                if (stale) stale.remove(); // 官方节点是后来才渲染出来的话，清掉我们早先插的那份
+            }
 
-            const { text, tip } = describe(Object.assign({ id }, info), ds.scale, day);
+            const { text, tip, delta, deltaTip } = describe(Object.assign({ id }, info), ds.scale, day);
 
-            let el = tops.querySelector('.tm-times');
+            let el = official || tops.querySelector('.tm-times');
             if (!el) {
                 el = doc.createElement('span');
-                el.className = 'times f-ff2 tm-times';   // 样式交给站点 CSS
+                el.className = 'times f-ff2 tm-times'; // 样式交给站点 CSS
+                el.appendChild(doc.createTextNode('')); // 正文单独一个文本节点，给子元素留位置
                 tops.appendChild(el);
             }
-            if (el.textContent !== text) el.textContent = text;
+            // 注意：这里不能写 el.textContent，那会把嵌套的 .tm-delta 一起清掉
+            if (!official) {
+                let tn = el.firstChild;
+                if (!tn || tn.nodeType !== 3) {
+                    tn = doc.createTextNode('');
+                    el.insertBefore(tn, el.firstChild);
+                }
+                if (tn.nodeValue !== text) tn.nodeValue = text;
+            }
             if (el.title !== tip) el.title = tip;
+
+            // 今日增量嵌在主数字里，跟着文本流紧贴其后，不单独定位
+            let dl = el.querySelector('.tm-delta');
+            if (delta) {
+                if (!dl) {
+                    dl = doc.createElement('span');
+                    dl.className = 'tm-delta'; // 不带 times，免被绝对定位拽走；字体从父级继承
+                    dl.style.cssText = 'margin-left:4px;'; // 唯一的内联样式，只管间距
+                    el.appendChild(dl);
+                }
+                if (dl.textContent !== delta) dl.textContent = delta;
+                if (dl.title !== deltaTip) dl.title = deltaTip;
+            } else if (dl) {
+                dl.remove(); // 今日无新增：不留一个空的尾巴
+            }
         }
         return hit;
     }
@@ -316,14 +359,18 @@
 
     let busy = false;
     let lastSig = '';
+    let hot = true; // 还没画上去过：高频轮询抢首屏
+    let timer = 0;
 
     async function tick() {
         if (busy) return;
-        const doc = getDoc();
-        if (!doc) { lastSig = ''; return; }
 
-        const uid = getUid(doc);
-        if (!uid) return;
+        const doc = getDoc();
+        const uid = doc ? getUid(doc) : hashUid();
+        if (!uid) { lastSig = ''; return; }
+
+        // 列表还没渲染出来：先把两个接口请求发出去，DOM 一到就能立刻画
+        if (!doc) { loadData(uid).catch(() => {}); return; }
 
         const sig = uid + '|' + doc.querySelectorAll('#m-record li').length + '|' +
             (doc.querySelector('#m-record li [data-res-id]') || {}).outerHTML;
@@ -331,17 +378,39 @@
 
         busy = true;
         try {
-            const data = await loadData(uid);
-            if (!data.week.map.size && !data.all.map.size) return;
-            const day = recordDaily(uid, data.week);      // 与当前 tab 无关，始终用周榜
-            if (inject(doc, pickDataset(doc, data), day)) lastSig = sig;
+            const data = await loadData(uid); // 预取命中时只是一个微任务，不再等网络
+            if (!data.week.map.size && !data.all.map.size) {
+                lastSig = sig;
+                hot = false; // 这个人没有公开排行，别再高频空转
+                return;
+            }
+            const day = recordDaily(uid, data.week); // 与当前 tab 无关，始终用周榜
+            const hit = inject(doc, pickDataset(doc, data), day);
+            lastSig = sig; // 标记这一版 DOM 已处理过，sig 一变（列表重渲染 / 切 tab）自然会重跑
+            if (hit) hot = false; // 首屏画完就降频，只留余量跟 tab 切换
         } finally {
             busy = false;
         }
     }
 
-    setInterval(tick, CFG.REFRESH_MS);
-    window.addEventListener('hashchange', () => { lastSig = ''; setTimeout(tick, 100); });
-    tick();
-    console.info('[Creepy Monitor] v3.2 已加载');
+    // 单一定时器自续：schedule 每次都清掉上一个，所以并发调用不会叠出两条循环
+    function schedule(ms) {
+        clearTimeout(timer);
+        timer = setTimeout(run, ms);
+    }
+
+    async function run() {
+        try { await tick(); } catch (e) { log('tick 异常', e); }
+        schedule(hot ? CFG.BOOT_MS : CFG.REFRESH_MS);
+    }
+
+    function kick() {
+        hot = true;
+        lastSig = '';
+        schedule(0);
+    }
+
+    window.addEventListener('hashchange', kick);
+    run();
+    console.info('[Creepy Monitor] v3.2.1 已加载');
 })();
