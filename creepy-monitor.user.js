@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.3.1
-// @description 在用户主页「听歌排行」里补上播放次数：格点反解，并靠周榜差分维护每人每天的听歌增量
+// @version 3.5.0
+// @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
 // @icon https://s1.music.126.net/style/favicon.ico?v20180823
@@ -26,7 +26,10 @@
         ASSUME_TOP_COUNT: 0, // 0 = 不用人为标尺
         BOOT_MS: 200, // 首次注入前的轮询间隔，抢时间
         REFRESH_MS: 600, // 注入成功后的轮询间隔，只用来跟 tab 切换
-        CACHE_MS: 60 * 1000,
+        CACHE_MS: 5 * 60 * 1000, // 排行数据缓存；切 tab、反复进出同一主页都不再发请求
+        MINE_DELAY_MS: 600, // 首屏画上后等多久再取「我听了 N 次」，避开网页自己的排行请求
+        MIN_GAP_MS: 300, // 两个接口请求之间的最小间隔，避免和网页自身请求挤在一起
+        FAIL_BACKOFF_MS: 60 * 1000, // 接口失败后多久内不再重试
         MAX_USERS: 60, // 日增量记录的人数上限（超出按最久未访问淘汰）
         DEBUG: false,
     };
@@ -63,13 +66,15 @@
         for (const k of Object.keys(u.days)) if (k < floor) delete u.days[k];
     }
 
-    // 一次观测：u 为该用户的记录，today 为日期串，W 为周榜反解出的 {songId: 本周次数}
-    // 返回 { counts, gap, exact } 或 null（首次观测只建基线）
-    function applyObservation(u, today, W) {
+    // 一次观测：wk 是周榜反解出的 {songId: 本周次数}，al 是全时间榜的 {songId: 真实累计次数}
+    // 两份差分合并成一张增量表：真值优先，反解只补真值鞭长莫及的行
+    // 返回 { counts, fromAll, gap, exact } 或 null（首次观测只建基线）
+    function applyObservation(u, today, wk, al) {
         if (!u.days) u.days = {};
 
+        const now = { day: today, week: wk, all: al };
         if (!u.cur) { // 首次：只存基线，没有差值可算
-            u.cur = { day: today, counts: W };
+            u.cur = now;
             return null;
         }
 
@@ -78,18 +83,33 @@
             gap = daysBetween(u.cur.day, today);
             if (gap !== 1) u.dirty = today; // 漏访会在 7 天内污染差分链条
             u.base = u.cur;
-            u.cur = { day: today, counts: W };
+            u.cur = now;
         } else { // 同一天重复访问：只刷新当日快照
-            u.cur.counts = W;
+            u.cur.week = wk;
+            u.cur.all = al;
         }
 
         if (!u.base) return null;
 
+        const baseWeek = u.base.week || {};
+        const baseAll = u.base.all || {};
         const comp = u.days[shiftDay(today, -7)] || null; // 7 天前的日增量
         const counts = {};
-        const ids = new Set([...Object.keys(W), ...Object.keys(u.base.counts)]);
-        for (const id of ids) {
-            const d = (W[id] || 0) - (u.base.counts[id] || 0) + (comp ? (comp[id] || 0) : 0);
+        const fromAll = new Set();
+
+        // 1) 全时间榜：两边都在榜才有差分可言。新进榜的歌不知道之前累计多少，
+        // 拿 0 当基线会把它一生的播放量都算成今天听的，直接跳过
+        for (const id of Object.keys(al)) {
+            if (!(id in baseAll)) continue;
+            counts[id] = Math.max(0, al[id] - baseAll[id]);
+            fromAll.add(id);
+        }
+
+        // 2) 周榜：补上不在全时间 top100 的歌。周榜是 7 天滑动窗口，
+        // 7 天前那天的增量已滑出，必须加回来
+        for (const id of Object.keys(wk)) {
+            if (!(id in baseWeek) || id in counts) continue;
+            const d = wk[id] - baseWeek[id] + (comp ? (comp[id] || 0) : 0);
             counts[id] = Math.max(0, d); // 掉出榜单导致的负值钳到 0
         }
 
@@ -98,7 +118,7 @@
 
         // 只有「补偿项在手 + 昨天确实访问过 + 最近 8 天没漏访」才算精确
         const clean = !u.dirty || daysBetween(u.dirty, today) >= 8;
-        return { counts, gap, exact: !!comp && gap === 1 && clean };
+        return { counts, fromAll, gap, exact: !!comp && gap === 1 && clean };
     }
 
     function solveScale(scores) {
@@ -125,11 +145,29 @@
     /* ---------------- 接口层 ---------------- */
 
     const cache = new Map(); // uid -> { t, week, all }
+    const failUntil = new Map(); // uid -> 重试时间，失败后退避，避免反复追打接口
     const inflight = new Map(); // uid -> Promise，避免同一个 uid 重复请求
 
+    // 所有接口请求都走这里：串行 + 最小间隔。
+    // 网页自己在同一时刻也要请求排行，三个请求并发容易被限流，把页面那一条挤掉
+    let lastReqAt = 0;
+    let chain = Promise.resolve();
+
+    function request(url) {
+        const run = async () => {
+            const wait = CFG.MIN_GAP_MS - (Date.now() - lastReqAt);
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            lastReqAt = Date.now();
+            const r = await fetch(url, { credentials: 'include' });
+            return r.ok ? r.json() : null;
+        };
+        const p = chain.then(run, run);
+        chain = p.catch(() => {});
+        return p;
+    }
+
     function fetchRecord(uid, type) {
-        return fetch(`/api/v1/play/record?uid=${uid}&type=${type}`, { credentials: 'include' })
-            .then(r => (r.ok ? r.json() : null))
+        return request(`/api/v1/play/record?uid=${uid}&type=${type}`)
             .catch(err => { log('接口失败', type, err); return null; });
     }
 
@@ -152,12 +190,19 @@
     async function loadData(uid) {
         const hit = cache.get(uid);
         if (hit && Date.now() - hit.t < CFG.CACHE_MS) return hit;
+        if ((failUntil.get(uid) || 0) > Date.now()) return null; // 刚失败过，别继续追打接口
         if (inflight.has(uid)) return inflight.get(uid); // 预取和注入撞在一起时只发一次请求
 
         const p = (async () => {
-            const [week, all] = await Promise.all([fetchRecord(uid, 1), fetchRecord(uid, 0)]);
-            const data = { t: Date.now(), week: buildDataset(week, 'weekData'), all: buildDataset(all, 'allData') };
+            // type=-1 一次带回 allData 与 weekData，替掉原先 type=0 + type=1 的两次请求
+            const j = await fetchRecord(uid, -1);
+            if (!j) {
+                failUntil.set(uid, Date.now() + CFG.FAIL_BACKOFF_MS);
+                return null;
+            }
+            const data = { t: Date.now(), week: buildDataset(j, 'weekData'), all: buildDataset(j, 'allData') };
             if (data.week.map.size || data.all.map.size) cache.set(uid, data);
+            failUntil.delete(uid);
             return data;
         })();
 
@@ -176,8 +221,7 @@
         if (me.asked) return me.uid;
         me.asked = true;
         try {
-            const r = await fetch('/api/nuser/account/get', { credentials: 'include' });
-            const j = r.ok ? await r.json() : null;
+            const j = await request('/api/nuser/account/get');
             const id = j && ((j.profile && j.profile.userId) || (j.account && j.account.id));
             me.uid = id ? String(id) : null;
         } catch (e) { log('取登录用户失败', e); }
@@ -204,12 +248,29 @@
 
     /* ---------------- 存储 ---------------- */
 
+    // v3.4 之前快照只有一个 counts（周榜反解），升级后拆成 week / all。
+    // 旧数据当场翻译成 week，全时间那半从今天开始积累，不丢历史
+    function migrate(u) {
+        for (const k of ['cur', 'base']) {
+            const s = u[k];
+            if (s && s.counts && !s.week) {
+                s.week = s.counts;
+                s.all = {};
+                delete s.counts;
+            }
+        }
+        return u;
+    }
+
     function loadStore() {
         try {
             const s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
-            if (s && s.users) return s;
+            if (s && s.users) {
+                for (const k of Object.keys(s.users)) migrate(s.users[k]);
+                return s;
+            }
         } catch (e) { log('读取存储失败', e); }
-        return { v: 1, users: {} };
+        return { v: 2, users: {} };
     }
 
     function saveStore(s) {
@@ -217,23 +278,32 @@
         catch (e) { log('写入存储失败', e); }
     }
 
-    // 用周榜反解出「本周每首歌的次数」，再交给 applyObservation 做差分
-    function recordDaily(uid, weekDs) {
-        if (!CFG.DAILY || !weekDs || !weekDs.scale) return null;
-        if (weekDs.scale.M >= SATURATION) return null; // 周榜标尺饱和，次数不可靠，不记录
+    // 两份数据各取所长，交给 applyObservation 合并：
+    // 周榜反解覆盖「最近一周」tab，全时间真值覆盖「所有时间」tab，一份增量表两个 tab 通用
+    function recordDaily(uid, weekDs, allDs) {
+        if (!CFG.DAILY) return null;
 
-        const W = {};
-        for (const [id, info] of weekDs.map) {
-            const c = weekDs.scale.countOf.get(info.score);
-            if (c !== undefined) W[id] = c;
+        // 周榜只有 score，标尺饱和时这一份整份丢掉，只留全时间真值
+        let wk = null;
+        if (weekDs && weekDs.scale && weekDs.scale.M < SATURATION) {
+            wk = {};
+            for (const [id, info] of weekDs.map) {
+                const c = weekDs.scale.countOf.get(info.score);
+                if (c !== undefined) wk[id] = c;
+            }
         }
+
+        // 全时间榜的 playCount 是服务端给的绝对值，不依赖任何标尺
+        const al = {};
+        if (allDs) for (const [id, info] of allDs.map) if (info.playCount > 0) al[id] = info.playCount;
+        if (!wk && !Object.keys(al).length) return null;
 
         const store = loadStore();
         const u = store.users[uid] || (store.users[uid] = { days: {} });
         u.seen = Date.now();
 
         const today = dayKey(new Date());
-        const res = applyObservation(u, today, W);
+        const res = applyObservation(u, today, wk || {}, al);
 
         // 人数上限：淘汰最久未访问的
         const uids = Object.keys(store.users);
@@ -244,8 +314,9 @@
         }
         saveStore(store);
 
-        if (!res) return { counts: {}, time: new Date().toTimeString().slice(0, 5), exact: false, warm: true };
-        return { counts: res.counts, time: new Date().toTimeString().slice(0, 5), exact: res.exact, gap: res.gap };
+        const time = new Date().toTimeString().slice(0, 5);
+        if (!res) return { counts: {}, time, exact: false, warm: true };
+        return { counts: res.counts, fromAll: res.fromAll, time, exact: res.exact, gap: res.gap };
     }
 
     /* ---------------- 页面定位 ---------------- */
@@ -304,8 +375,11 @@
 
         if (day && day.counts) {
             const n = day.counts[info.id] || 0;
-            const note = day.exact ? '' : '，含窗口滑出的估算误差';
-            r.deltaTip = `今日新增 ${n} 次（${day.time} 观测）${note}`;
+            const truth = day.fromAll && day.fromAll.has(info.id);
+            const src = truth
+                ? (day.gap === 1 ? '，全时间榜真值差分' : `，全时间榜真值差分但跨了 ${day.gap} 天`)
+                : (day.exact ? '，周榜反解差分' : '，周榜反解差分，含窗口滑出的估算误差');
+            r.deltaTip = `今日新增 ${n} 次（${day.time} 观测${src}）`;
             if (day.warm) r.tip += '；今日增量首个观测日，明日开始统计';
             else if (n > 0) r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
             else r.tip += `；${r.deltaTip}`;
@@ -436,7 +510,7 @@
         const uid = doc ? getUid(doc) : hashUid();
         if (!uid) { lastSig = ''; return; }
 
-        // 列表还没渲染出来：先把两个接口请求发出去，DOM 一到就能立刻画
+        // 列表还没渲染出来：先把接口请求发出去，DOM 一到就能立刻画
         if (!doc) { loadData(uid).catch(() => {}); return; }
 
         const sig = uid + '|' + doc.querySelectorAll('#m-record li').length + '|' +
@@ -446,41 +520,44 @@
         busy = true;
         try {
             const data = await loadData(uid); // 预取命中时只是一个微任务，不再等网络
+            if (!data) return; // 接口失败或退避中：保持现状，下一轮再来
             if (!data.week.map.size && !data.all.map.size) {
                 lastSig = sig;
                 hot = false; // 这个人没有公开排行，别再高频空转
                 return;
             }
-            const day = recordDaily(uid, data.week); // 与当前 tab 无关，始终用周榜
+            const day = recordDaily(uid, data.week, data.all); // 两份都喂，与当前 tab 无关
             // 自己的主页不需要「我听了 N 次」，那栏本来就显示真实次数
             const hit = inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
             lastSig = sig; // 标记这一版 DOM 已处理过，sig 一变（列表重渲染 / 切 tab）自然会重跑
             if (hit) hot = false; // 首屏画完就降频，只留余量跟 tab 切换
 
-            // 我的次数是补充信息，先去渲染别人的次数；取到后再补画一次，不拖慢首屏
-            if (CFG.SHOW_MINE) warmMine(doc, data, day, uid).catch(e => log('我的次数失败', e));
+            // 首屏已经画上了，才轮到「我的次数」出场，不和排行请求抢带宽
+            if (hit && CFG.SHOW_MINE) scheduleMine();
         } finally {
             busy = false;
         }
     }
 
-    // 只在看他人主页时用得上：先拿自己的 uid，再取自己的周榜
-    async function warmMine(doc, data, day, uid) {
-        const meUid = await getMe();
-        if (!meUid || uid === meUid) return;
-        if (!mineMap || Date.now() - mineAt >= CFG.CACHE_MS) await loadMine();
-        if (!mineMap) return;
-        if (getDoc() !== doc) return; // 期间已经切到别的页面了
-        inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
-    }
+    // 只在用户主页才需要「我听了 N 次」。
+    // 不跟首屏抢：等别人次数画完、网页自己的排行请求也发出去之后，再取我自己的两份数据
+    let mineScheduled = false;
 
-    // 只在用户主页才需要「我听了 N 次」；趁首屏还在渲染时先并行取回来
-    function preloadMine() {
-        const onpage = hashUid();
-        if (!CFG.SHOW_MINE || !onpage) return;
-        getMe()
-            .then(id => (id && id !== onpage ? loadMine() : null)) // 自己的主页不必拉自己的周榜
-            .catch(e => log('预取我的次数失败', e));
+    function scheduleMine() {
+        if (!CFG.SHOW_MINE || mineScheduled) return;
+        mineScheduled = true;
+        setTimeout(() => {
+            getMe()
+                .then(id => {
+                    if (!id || id === hashUid()) return null; // 自己的主页不必拉自己的周榜
+                    return loadMine().then(() => {
+                        if (!mineMap) return;
+                        lastSig = ''; // 我的次数到了，重画一遍
+                        schedule(0);
+                    });
+                })
+                .catch(e => log('预取我的次数失败', e));
+        }, CFG.MINE_DELAY_MS);
     }
 
     // 单一定时器自续：schedule 每次都清掉上一个，所以并发调用不会叠出两条循环
@@ -497,12 +574,11 @@
     function kick() {
         hot = true;
         lastSig = '';
-        preloadMine();
+        if (!mineMap) mineScheduled = false; // 换了页面，允许再取一次我的次数
         schedule(0);
     }
 
     window.addEventListener('hashchange', kick);
-    preloadMine();
     run();
-    console.info('[Creepy Monitor] v3.3.1 已加载');
+    console.info('[Creepy Monitor] v3.5.0 已加载');
 })();
