@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.5.1
+// @version 3.5.2
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -100,12 +100,9 @@
         const newIds = new Set(); // 今天新进榜、没有基线的歌
 
         // 1) 全时间榜：两边都在榜才有差分可言。新进榜的歌不知道之前累计多少，
-        // 拿 0 当基线会把它一生的播放量都算成今天听的，直接跳过
+        // 拿 0 当基线会把它一生的播放量都算成今天听的（几百次），只能跳过
         for (const id of Object.keys(al)) {
-            if (!(id in baseAll)) {
-                if (!coldAll) newIds.add(id);
-                continue;
-            }
+            if (!(id in baseAll)) continue;
             counts[id] = Math.max(0, al[id] - baseAll[id]);
             fromAll.add(id);
         }
@@ -113,11 +110,14 @@
         // 2) 周榜：补上不在全时间 top100 的歌。周榜是 7 天滑动窗口，
         // 7 天前那天的增量已滑出，必须加回来
         for (const id of Object.keys(wk)) {
+            if (id in counts) continue;
             if (!(id in baseWeek)) {
-                if (!coldAll) newIds.add(id); // 昨天不在周榜，今天的累计里混着前几天的播放
+                // 昨天不在榜：本周累计里可能混着前几天的播放，拿它当今日增量是**上限**。
+                // 但新进榜大多是「今天才开始听」，多数时候就等于当日值，所以照给
+                newIds.add(id);
+                counts[id] = wk[id];
                 continue;
             }
-            if (id in counts) continue;
             const d = wk[id] - baseWeek[id] + (comp ? (comp[id] || 0) : 0);
             counts[id] = Math.max(0, d); // 掉出榜单导致的负值钳到 0
         }
@@ -390,6 +390,10 @@
             const n = day.counts[info.id] || 0;
             if (day.warm) {
                 r.tip += '；今日增量首个观测日，明日开始统计';
+            } else if (n > 0 && day.newIds && day.newIds.has(info.id)) {
+                // 新进榜：本周累计当上限。多数时候这首歌就是今天才开始听的，值恰好等于当日
+                r.delta = `+${n}`;
+                r.deltaTip = `今天新进榜，本周累计 ${n} 次（今日上限，可能含前几天的播放）`;
             } else if (n > 0) {
                 const truth = day.fromAll && day.fromAll.has(info.id);
                 const src = truth
@@ -397,8 +401,6 @@
                     : (day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差');
                 r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
                 r.deltaTip = `今日新增 ${n} 次（${day.time} 观测，${src}）`;
-            } else if (day.newIds && day.newIds.has(info.id)) {
-                r.tip += '；今天新进榜，昨天没有基线，算不出今日增量';
             } else if (day.coldAll) {
                 r.tip += '；全时间榜基线今天才建立，明天起这一页才有增量';
             } else {
@@ -601,5 +603,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.5.1 已加载');
+    console.info('[Creepy Monitor] v3.5.2 已加载');
 })();
