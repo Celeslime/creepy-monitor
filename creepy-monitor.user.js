@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.5.2
+// @version 3.6.0
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -37,6 +37,8 @@
     // 站点公式（真实数据 100/100 验证）：score = floor(playCount * 100 / M)，M = 榜首次数
     // M >= 97 时格点步长 <= 1.031，必然覆盖 0..100，反解退化成常数 —— 标尺不可识别
     const SATURATION = 96;
+    const SAT_MAX = 2000; // 饱和标尺的搜索上界：一周 2000 次以上就不再猜了
+    const SAT_SLACK = 0.05; // 锁定的区间宽于 5% 就不算锁定，只报下界
     const STORE_KEY = 'tm_w163_daily_v1';
 
     const log = (...a) => CFG.DEBUG && console.log('[Creepy Monitor]', ...a);
@@ -147,6 +149,43 @@
             return { M, countOf };
         }
         return null;
+    }
+
+    // score 对应的次数区间：s = floor(100c/M)，解出 c ∈ [⌈s·M/100⌉, ⌈(s+1)·M/100⌉ − 1]
+    function bandOf(score, lo, hi) {
+        const a = Math.ceil(score * lo / 100);
+        const b = Math.ceil((score + 1) * hi / 100) - 1;
+        return [a, Math.max(a, b)];
+    }
+
+    // 硬下界。播放次数不会倒退：今天次数 ≥ 昨天次数 − 已滑出窗口的那天。
+    // 于是 c ≥ prior 且 s = floor(100c/M) ⟹ M > 100·prior/(s+1)，逐首取最大。
+    // prior 先减 1，兜住差分链条上 ±1 的踩点误差
+    function hardBound(pairs, minM) {
+        let hard = minM;
+        for (const p of pairs) {
+            const c = Math.max(1, p.prior - 1);
+            hard = Math.max(hard, Math.floor(100 * c / (p.score + 1)) + 1);
+        }
+        return hard;
+    }
+
+    // 软区间。周榜只给 score = floor(100c/M)，M ≥ 97 时格点铺满 0..100，
+    // 单看一份榜单根本无从反解。但没动过的那批歌，prior 就是它的本周真实次数，
+    // 于是「谁的 prior 能倒出自己的 score」成了筛子，扫一遍就能把 M 卡成窄区间
+    function pinScale(pairs, start) {
+        let best = -1, lo = start, hi = start;
+        for (let M = start; M <= SAT_MAX; M++) {
+            let hit = 0;
+            for (const p of pairs) if (Math.floor(100 * p.prior / M) === p.score) hit++;
+            if (hit > best) { best = hit; lo = hi = M; }
+            else if (hit === best) hi = M;
+        }
+
+        // 大半对不上：今天这批歌基本都在涨，prior 已经不是次数了
+        if (best < Math.max(3, pairs.length * 0.6)) return { lo: start, hi: null, agree: best };
+        if (hi >= SAT_MAX) return { lo, hi: null, agree: best }; // 极值落在搜索上界，只能说到这儿
+        return { lo, hi, agree: best };
     }
 
     /* ================= PURE-END ================= */
@@ -288,32 +327,95 @@
         catch (e) { log('写入存储失败', e); }
     }
 
+    // 用上一次的快照给周榜标尺定界。返回 null 表示没有先验可用；
+    // { hard } 表示只拿到下界；{ hard, lo, hi, counts, band } 表示把 M 卡进了窄区间
+    function pinWeek(u, weekDs, today, exactM) {
+        const base = u.cur; // 上次访问留下的快照（applyObservation 之后才会推进成 base）
+        if (!base || !base.week || !Object.keys(base.week).length) return null;
+        const gap = daysBetween(base.day, today);
+        if (gap > 1) return null; // 中间漏了天，滑出量算不全
+
+        // 跨了一天才有「滑出窗口」这回事；同一天重访时快照已经是今天的窗口，
+        // 再扣滑出量和误差半径就会每刷一次往里缩一格
+        const drop = gap === 1 ? (u.days[shiftDay(today, -7)] || {}) : {};
+        const slack = gap === 1 ? (base.w || 0) : 0;
+        const prior = new Map();
+        const pairs = [];
+        for (const [id, info] of weekDs.map) {
+            if (!(id in base.week)) continue; // 新进榜：没有基线，不参与定界
+            const p = base.week[id] - (drop[id] || 0) - slack;
+            if (p <= 0) continue;
+            prior.set(id, p);
+            pairs.push({ score: info.score, prior: p });
+        }
+        if (!pairs.length) return null;
+
+        const sat = exactM === null || exactM >= SATURATION;
+        const hard = hardBound(pairs, sat ? SATURATION : 1);
+        // 下界都越过搜索上界了，说明先验本身离谱 —— 宁可不说话
+        if (hard > SAT_MAX) return null;
+        // 精确反解没被下界证伪，就没必要再折腾
+        if (!sat && exactM >= hard) return { hard, ok: true };
+
+        const pin = pinScale(pairs, hard);
+        if (pin.hi === null || pin.hi - pin.lo > Math.max(3, pin.lo * SAT_SLACK)) {
+            return { hard, lo: pin.lo, agree: pin.agree }; // 只定住下界
+        }
+
+        // 每首歌的次数：先验落在区间里就取先验（那就是「今天没动」），否则取中点
+        const counts = new Map();
+        const band = new Map();
+        for (const [id, info] of weekDs.map) {
+            // 榜首的次数按定义就是 M 本身，不用再进格点
+            const [a, b] = info.score === 100 ? [pin.lo, pin.hi] : bandOf(info.score, pin.lo, pin.hi);
+            const p = prior.get(id);
+            counts.set(id, p !== undefined && p >= a && p <= b ? p : Math.round((a + b) / 2));
+            band.set(id, [a, b]);
+        }
+        return { hard, lo: pin.lo, hi: pin.hi, counts, band, agree: pin.agree };
+    }
+
     // 两份数据各取所长，交给 applyObservation 合并：
     // 周榜反解覆盖「最近一周」tab，全时间真值覆盖「所有时间」tab，一份增量表两个 tab 通用
     function recordDaily(uid, weekDs, allDs) {
         if (!CFG.DAILY) return null;
 
-        // 周榜只有 score，标尺饱和时这一份整份丢掉，只留全时间真值
+        const store = loadStore();
+        const u = store.users[uid] || (store.users[uid] = { days: {} });
+        const today = dayKey(new Date());
+
+        const exactM = weekDs && weekDs.scale ? weekDs.scale.M : null;
+        const exactOk = exactM !== null && exactM < SATURATION;
+        const pin = weekDs && weekDs.map.size ? pinWeek(u, weekDs, today, exactM) : null;
+        // 精确解落在锁定区间里就信精确解；落在外面说明它被下界证伪了
+        const usePin = !!(pin && pin.counts && !(exactOk && exactM >= pin.lo && exactM <= pin.hi));
+
         let wk = null;
-        if (weekDs && weekDs.scale && weekDs.scale.M < SATURATION) {
+        let width = 0; // 这份次数的误差半径，0 表示精确反解
+        let bound = pin && !usePin && pin.hard > (exactOk ? exactM : 0) ? pin.hard : 0;
+
+        if (usePin) {
+            wk = {};
+            for (const [id, c] of pin.counts) wk[id] = c;
+            width = Math.ceil((pin.hi - pin.lo) / 2); // 区间退化成一点时 width=0，当作精确值
+            weekDs.scale = weekDs.scale || { M: SATURATION, countOf: new Map() };
+        } else if (exactOk) {
             wk = {};
             for (const [id, info] of weekDs.map) {
                 const c = weekDs.scale.countOf.get(info.score);
                 if (c !== undefined) wk[id] = c;
             }
         }
+        if (weekDs && weekDs.scale) weekDs.scale.pin = usePin ? pin : null; // 交给 describe 渲染
 
         // 全时间榜的 playCount 是服务端给的绝对值，不依赖任何标尺
         const al = {};
         if (allDs) for (const [id, info] of allDs.map) if (info.playCount > 0) al[id] = info.playCount;
         if (!wk && !Object.keys(al).length) return null;
 
-        const store = loadStore();
-        const u = store.users[uid] || (store.users[uid] = { days: {} });
         u.seen = Date.now();
-
-        const today = dayKey(new Date());
         const res = applyObservation(u, today, wk || {}, al);
+        if (width && u.cur) u.cur.w = width; // 估算快照的误差半径，明天当先验要打折
 
         // 人数上限：淘汰最久未访问的
         const uids = Object.keys(store.users);
@@ -328,7 +430,7 @@
         if (!res) return { counts: {}, time, exact: false, warm: true };
         return {
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds, coldAll: res.coldAll,
-            time, exact: res.exact, gap: res.gap,
+            time, exact: res.exact, gap: res.gap, est: width, bound,
         };
     }
 
@@ -362,26 +464,42 @@
 
     function describe(info, scale, day) {
         let r;
+        const bound = day && day.bound; // 饱和标尺卡出来的下界
 
         if (info.playCount > 0) {
             r = { text: `${info.playCount}次`, tip: `播放 ${info.playCount} 次（接口返回的真实数据）` };
         } else {
             const sat = !scale || scale.M >= SATURATION;
             const solved = scale && scale.countOf.has(info.score) ? scale.countOf.get(info.score) : null;
+            const pin = scale && scale.pin; // 饱和标尺被历史次数锁定时的区间估计
+            const pinned = pin && pin.counts ? pin.counts.get(info.id) : undefined;
 
-            if (CFG.MODE === 'count' && scale) {
+            if (CFG.MODE !== 'percent' && pinned !== undefined) {
+                const [a, b] = pin.band.get(info.id);
+                const range = pin.lo === pin.hi ? `M=${pin.lo}` : `M=${pin.lo}~${pin.hi}`;
+                r = a === b
+                    ? { text: `${a}次`, tip: `标尺按上一次的记录锁在 ${range}，这一行的次数唯一` }
+                    : { text: `~${pinned}次`, tip: `标尺按上一次的记录锁在 ${range}，这一行落在 ${a}~${b} 次` };
+            } else if (CFG.MODE === 'count' && scale) {
                 r = solved !== null && !sat
                     ? { text: `${solved}次`, tip: `格点反解，M=${scale.M}` }
-                    : { text: `≥${scale.M}次`, tip: `反解下限 ${scale.M} 次，真实值可能远高于此` };
+                    : { text: `≥${bound || scale.M}次`, tip: `标尺饱和，只定得住下界，真实值可能远高于此` };
             } else if (CFG.MODE !== 'percent' && solved !== null && !sat) {
-                r = { text: `${solved}次`, tip: `格点反解得到唯一标尺 M=${scale.M}，次数可信` };
+                r = {
+                    text: `${solved}次`,
+                    tip: bound
+                        ? `格点反解给出 M=${scale.M}，但历史次数显示至少 ${bound} 次，这个标尺偏小了`
+                        : `格点反解得到唯一标尺 M=${scale.M}，次数可信`,
+                };
             } else if (CFG.ASSUME_TOP_COUNT > 0) {
                 const M = CFG.ASSUME_TOP_COUNT;
                 const lo = Math.ceil(info.score * M / 100);
                 const hi = Math.max(lo, Math.ceil((info.score + 1) * M / 100) - 1);
-                r = { text: `≈${Math.round((lo + hi) / 2)}次`, tip: `按榜首=${M}次推算，区间 ${lo}~${hi} 次` };
+                r = { text: `~${Math.round((lo + hi) / 2)}次`, tip: `按榜首=${M}次推算，区间 ${lo}~${hi} 次` };
             } else {
-                const low = scale ? `，反解下限 ≥${scale.M} 次但标尺已饱和` : '';
+                const low = bound
+                    ? `；榜首本周至少 ${bound} 次（靠昨天的次数卡出来的下界）`
+                    : (scale ? `，反解下限 ≥${scale.M} 次但标尺已饱和` : '');
                 r = { text: `${info.score}%`, tip: `占榜首播放量的 ${info.score}%${low}` };
             }
         }
@@ -398,7 +516,9 @@
                 const truth = day.fromAll && day.fromAll.has(info.id);
                 const src = truth
                     ? (day.gap === 1 ? '全时间榜真值差分' : `全时间榜真值差分但跨了 ${day.gap} 天`)
-                    : (day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差');
+                    : day.est
+                        ? `周榜标尺靠历史次数锁定，误差 ±${day.est} 次`
+                        : (day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差');
                 r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
                 r.deltaTip = `今日新增 ${n} 次（${day.time} 观测，${src}）`;
             } else if (day.coldAll) {
@@ -603,5 +723,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.5.2 已加载');
+    console.info('[Creepy Monitor] v3.6.0 已加载');
 })();
