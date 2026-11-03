@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.2.1
+// @version 3.3.1
 // @description 在用户主页「听歌排行」里补上播放次数：格点反解，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -22,6 +22,7 @@
         // percent 总是显示占比
         MODE: 'auto',
         DAILY: true, // 是否记录 / 显示今日增量
+        SHOW_MINE: true, // 他人主页上附注「我最近一周听过几次」
         ASSUME_TOP_COUNT: 0, // 0 = 不用人为标尺
         BOOT_MS: 200, // 首次注入前的轮询间隔，抢时间
         REFRESH_MS: 600, // 注入成功后的轮询间隔，只用来跟 tab 切换
@@ -164,6 +165,43 @@
         try { return await p; } finally { inflight.delete(uid); }
     }
 
+    /* ---- 我自己：登录者 uid 与「最近一周听过几次」 ---- */
+
+    const me = { asked: false, uid: null };
+    let mineMap = null; // songId -> 我最近一周的真实次数
+    let mineAt = 0;
+
+    // 未登录时接口返回 account: null，不会抛错
+    async function getMe() {
+        if (me.asked) return me.uid;
+        me.asked = true;
+        try {
+            const r = await fetch('/api/nuser/account/get', { credentials: 'include' });
+            const j = r.ok ? await r.json() : null;
+            const id = j && ((j.profile && j.profile.userId) || (j.account && j.account.id));
+            me.uid = id ? String(id) : null;
+        } catch (e) { log('取登录用户失败', e); }
+        return me.uid;
+    }
+
+    // 本人账号的 playCount 是接口给的真值，不需要反解，也不受标尺饱和影响。
+    // 只要最近一周，不拉「全部时间」，省掉一次请求
+    async function loadMine() {
+        const hit = await getMe();
+        if (!hit) return null;
+
+        const cached = cache.get(hit);
+        const weekDs = cached && Date.now() - cached.t < CFG.CACHE_MS
+            ? cached.week
+            : buildDataset(await fetchRecord(hit, 1), 'weekData');
+
+        const map = new Map();
+        for (const [id, info] of weekDs.map) if (info.playCount > 0) map.set(id, info.playCount);
+        mineMap = map.size ? map : null;
+        mineAt = Date.now();
+        return mineMap;
+    }
+
     /* ---------------- 存储 ---------------- */
 
     function loadStore() {
@@ -277,6 +315,13 @@
 
     /* ---------------- 渲染 ---------------- */
 
+    // 「我听了 N 次」：原版 .times 的镜像，只是贴到右端。
+    // 原版 pt_profile_ranking.css 里：
+    // .tops{position:relative;height:38px;line-height:38px}
+    // .tops span.times{position:absolute;left:10px;height:38px;line-height:38px;color:#666}
+    // 所以这里也不写 font-size / font-family，交给 .f-ff2 与继承，字号才和左边的数字一致
+    const MINE_CSS = 'position:absolute; right:10px; top:0; z-index:2; color:#666;';
+
     function pickDataset(doc, data) {
         const rows = [...doc.querySelectorAll('#m-record li')];
         const errOf = ds => {
@@ -298,7 +343,7 @@
         return errOf(data.week) <= errOf(data.all) ? data.week : data.all;
     }
 
-    function inject(doc, ds, day) {
+    function inject(doc, ds, day, mine, self) {
         let hit = 0;
         for (const li of doc.querySelectorAll('#m-record li')) {
             const res = li.querySelector('[data-res-id]');
@@ -351,6 +396,28 @@
             } else if (dl) {
                 dl.remove(); // 今日无新增：不留一个空的尾巴
             }
+
+            // 我最近一周听过这首歌几次：接口对我本人返回的是真数，不是估算。
+            // 只是贴在右端的一行普通文字，和原版 .times 一起构成左右对称
+            const my = !self && mine ? mine.get(id) || 0 : 0;
+            let mi = tops.querySelector('.tm-mine');
+            if (my > 0) {
+                if (!mi) {
+                    mi = doc.createElement('span');
+                    mi.className = 'f-ff2 tm-mine'; // f-ff2 是原版数字用的字体类
+                    mi.style.cssText = MINE_CSS;
+                    // 挂在 .tops 里（原版就是 relative + 38px 高），定位以它为参照
+                    const win = doc.defaultView || window;
+                    if (win.getComputedStyle(tops).position === 'static') tops.style.position = 'relative';
+                    tops.appendChild(mi);
+                }
+                const myText = `我听了 ${my} 次`;
+                const myTip = `你最近 7 天听了这首歌 ${my} 次，取自本人账号接口的真实数据`;
+                if (mi.textContent !== myText) mi.textContent = myText;
+                if (mi.title !== myTip) mi.title = myTip;
+            } else if (mi) {
+                mi.remove();
+            }
         }
         return hit;
     }
@@ -385,12 +452,35 @@
                 return;
             }
             const day = recordDaily(uid, data.week); // 与当前 tab 无关，始终用周榜
-            const hit = inject(doc, pickDataset(doc, data), day);
+            // 自己的主页不需要「我听了 N 次」，那栏本来就显示真实次数
+            const hit = inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
             lastSig = sig; // 标记这一版 DOM 已处理过，sig 一变（列表重渲染 / 切 tab）自然会重跑
             if (hit) hot = false; // 首屏画完就降频，只留余量跟 tab 切换
+
+            // 我的次数是补充信息，先去渲染别人的次数；取到后再补画一次，不拖慢首屏
+            if (CFG.SHOW_MINE) warmMine(doc, data, day, uid).catch(e => log('我的次数失败', e));
         } finally {
             busy = false;
         }
+    }
+
+    // 只在看他人主页时用得上：先拿自己的 uid，再取自己的周榜
+    async function warmMine(doc, data, day, uid) {
+        const meUid = await getMe();
+        if (!meUid || uid === meUid) return;
+        if (!mineMap || Date.now() - mineAt >= CFG.CACHE_MS) await loadMine();
+        if (!mineMap) return;
+        if (getDoc() !== doc) return; // 期间已经切到别的页面了
+        inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
+    }
+
+    // 只在用户主页才需要「我听了 N 次」；趁首屏还在渲染时先并行取回来
+    function preloadMine() {
+        const onpage = hashUid();
+        if (!CFG.SHOW_MINE || !onpage) return;
+        getMe()
+            .then(id => (id && id !== onpage ? loadMine() : null)) // 自己的主页不必拉自己的周榜
+            .catch(e => log('预取我的次数失败', e));
     }
 
     // 单一定时器自续：schedule 每次都清掉上一个，所以并发调用不会叠出两条循环
@@ -407,10 +497,12 @@
     function kick() {
         hot = true;
         lastSig = '';
+        preloadMine();
         schedule(0);
     }
 
     window.addEventListener('hashchange', kick);
+    preloadMine();
     run();
-    console.info('[Creepy Monitor] v3.2.1 已加载');
+    console.info('[Creepy Monitor] v3.3.1 已加载');
 })();
