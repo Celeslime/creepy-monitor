@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.6.2
+// @version 3.6.4
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -151,7 +151,12 @@
                     counts[id] = wk[id];
                     continue;
                 }
-                const d = wk[id] - baseWeek[id] + (comp ? (comp[id] || 0) : 0);
+                // 昨天的窗口一定包含 7 天前那一天，所以昨天的累计不可能小于
+                // 那天的增量。小于就说明昨天的反解偏小了（标尺粗，2 次和 3 次
+                // 落在同一个 score 上），这时拿那天的增量当它的下界，否则补偿项
+                // 会被整个加回来，算出「本周 2 次、今日 +3」这种自相矛盾的值
+                const c7 = comp ? (comp[id] || 0) : 0;
+                const d = wk[id] - Math.max(baseWeek[id], c7) + c7;
                 counts[id] = Math.max(0, d); // 掉出榜单导致的负值钳到 0
             }
         }
@@ -467,23 +472,19 @@
         return { hard, lo: pin.lo, hi: pin.hi, counts, band, agree: pin.agree };
     }
 
-    // 两份数据各取所长，交给 applyObservation 合并：
-    // 周榜反解覆盖「最近一周」tab，全时间真值覆盖「所有时间」tab，一份增量表两个 tab 通用
-    function recordDaily(uid, weekDs, allDs) {
-        if (!CFG.DAILY) return null;
-
-        const store = loadStore();
-        const u = store.users[uid] || (store.users[uid] = { days: {} });
-        const today = dayKey(new Date());
+    // 这次观测该用哪把尺子、每首歌算几次、拿什么当「当天标尺」记下来。
+    // 只读两份数据集和昨天的状态，不碰存储，测试可以直接喂构造出来的对象。
+    // 返回的 scale 由调用方挂回 weekDs.scale —— describe 从那里取展示依据
+    function resolveWeek(weekDs, allDs, u, today) {
+        let scale = weekDs.scale;
 
         // 标尺优先钉在上次的取值上。一次观测能确定的往往只是一段区间 [M, ∞)，
         // 每天各挑各的最小值，同一首歌的「次数」就会随榜单稀疏度跳来跳去，
         // 差分算出来全是假的（38 次跳到 89 次 = 今天听了 51 次）。
         // 只要旧值还能解释今天的榜单就不换 —— 一把错的尺子未必比一把会飘的准
         const prevM = u.cur && u.cur.sc ? u.cur.sc.lo : null;
-        if (prevM && weekDs && weekDs.scale && weekDs.scale.M !== prevM
-            && fitsScale([...new Set(weekDs.scores)], prevM)) {
-            weekDs.scale = { M: prevM, countOf: countMapOf(prevM) };
+        if (prevM && scale && scale.M !== prevM && fitsScale([...new Set(weekDs.scores)], prevM)) {
+            scale = { M: prevM, countOf: countMapOf(prevM) };
         }
 
         // 榜首的终身累计 + 最近 7 天的累加，能把 M 直接夹住。这条路不经过标尺，
@@ -494,15 +495,15 @@
             const uniq = [...new Set(weekDs.scores)];
             for (let M = Math.max(1, anchor.lo); M <= anchor.hi; M++) {
                 if (!fitsScale(uniq, M)) continue;
-                weekDs.scale = { M, countOf: countMapOf(M), anchor: { lo: anchor.lo, hi: anchor.hi } };
+                scale = { M, countOf: countMapOf(M), anchor: { lo: anchor.lo, hi: anchor.hi } };
                 anchored = true;
                 break;
             }
         }
 
-        const exactM = weekDs && weekDs.scale ? weekDs.scale.M : null;
+        const exactM = scale ? scale.M : null;
         const exactOk = exactM !== null && (exactM < SATURATION || anchored);
-        const pin = !anchored && weekDs && weekDs.map.size ? pinWeek(u, weekDs, today, exactM) : null;
+        const pin = !anchored && weekDs.map.size ? pinWeek(u, weekDs, today, exactM) : null;
         // 精确解落在锁定区间里就信精确解；落在外面说明它被下界证伪了
         const usePin = !!(pin && pin.counts && !(exactOk && exactM >= pin.lo && exactM <= pin.hi));
 
@@ -514,34 +515,51 @@
             wk = {};
             for (const [id, c] of pin.counts) wk[id] = c;
             width = Math.ceil((pin.hi - pin.lo) / 2); // 区间退化成一点时 width=0，当作精确值
-            weekDs.scale = weekDs.scale || { M: SATURATION, countOf: new Map() };
-        } else if (weekDs && weekDs.scale) {
+            scale = scale || { M: SATURATION, countOf: new Map() };
+        } else if (scale) {
             // 标尺只定得住下界（榜单里有 score=0 就说明 M ≥ 101），单个次数不可信，
             // 但两天用同一把尺子时差分仍然成立，只是尺度整体可能缩水。
             // 存下来，明天才有东西可比
             wk = {};
             for (const [id, info] of weekDs.map) {
-                const c = weekDs.scale.countOf.get(info.score);
+                const c = scale.countOf.get(info.score);
                 if (c !== undefined) wk[id] = c;
             }
         }
-        if (weekDs && weekDs.scale) weekDs.scale.pin = usePin ? pin : null; // 交给 describe 渲染
-
-        // 全时间榜的 playCount 是服务端给的绝对值，不依赖任何标尺
-        const al = {};
-        if (allDs) for (const [id, info] of allDs.map) if (info.playCount > 0) al[id] = info.playCount;
-        if (!wk && !Object.keys(al).length) return null;
 
         // 记下这次实际用的是哪把尺子，明天要比对：换了尺子的两天不能相减
         const sc = usePin
             ? { lo: pin.lo, hi: pin.hi === null ? null : pin.hi }
-            : (anchored ? { lo: weekDs.scale.anchor.lo, hi: weekDs.scale.anchor.hi }
+            : (anchored ? { lo: scale.anchor.lo, hi: scale.anchor.hi }
                 : (exactOk ? { lo: exactM, hi: exactM }
-                    : (weekDs && weekDs.scale ? { lo: weekDs.scale.M, hi: null } : null)));
+                    : (scale ? { lo: scale.M, hi: null } : null)));
+
+        // pin 只挂在 scale 上给 describe 用，顺手拷一份，别改到传进来的数据集
+        if (scale) scale = Object.assign({}, scale, { pin: usePin ? pin : null });
+        return { scale, wk, sc, width, bound };
+    }
+
+    // 两份数据各取所长，交给 applyObservation 合并：
+    // 周榜反解覆盖「最近一周」tab，全时间真值覆盖「所有时间」tab，一份增量表两个 tab 通用
+    function recordDaily(uid, weekDs, allDs) {
+        if (!CFG.DAILY) return null;
+
+        const store = loadStore();
+        const u = store.users[uid] || (store.users[uid] = { days: {} });
+        const today = dayKey(new Date());
+
+        const r = weekDs && weekDs.map.size ? resolveWeek(weekDs, allDs, u, today) : null;
+        if (r && r.scale) weekDs.scale = r.scale; // describe 从这里取展示依据
+
+        // 全时间榜的 playCount 是服务端给的绝对值，不依赖任何标尺
+        const al = {};
+        if (allDs) for (const [id, info] of allDs.map) if (info.playCount > 0) al[id] = info.playCount;
+        const wk = r ? r.wk : null;
+        if (!wk && !Object.keys(al).length) return null;
 
         u.seen = Date.now();
-        const res = applyObservation(u, today, wk || {}, al, sc);
-        if (width && u.cur) u.cur.w = width; // 估算快照的误差半径，明天当先验要打折
+        const res = applyObservation(u, today, wk || {}, al, r ? r.sc : null);
+        if (r && r.width && u.cur) u.cur.w = r.width; // 估算快照的误差半径，明天当先验要打折
 
         // 人数上限：淘汰最久未访问的
         const uids = Object.keys(store.users);
@@ -557,8 +575,8 @@
         return {
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds,
             coldAll: res.coldAll, coldWeek: res.coldWeek,
-            time, exact: res.exact, gap: res.gap, est: width, bound,
-            scaleMoved: res.scaleMoved, prevScale: res.prevScale, scale: sc,
+            time, exact: res.exact, gap: res.gap, est: r ? r.width : 0, bound: r ? r.bound : 0,
+            scaleMoved: res.scaleMoved, prevScale: res.prevScale, scale: r ? r.sc : null,
         };
     }
 
@@ -784,6 +802,16 @@
     let hot = true; // 还没画上去过：高频轮询抢首屏
     let timer = 0;
 
+    // 「这一版列表处理过没有」的指纹。除了 uid、行数、首行内容，还要看我插的节点
+    // 还在不在：列表被重渲染回原样时前三个特征一模一样，只看它们会误判成已处理，
+    // 已经画上去的数字被冲掉之后再也补不回来
+    function sigOf(doc, uid) {
+        const first = doc.querySelector('#m-record li [data-res-id]');
+        const stamped = doc.querySelector('#m-record .tm-times, #m-record .tm-delta, #m-record .tm-mine');
+        return uid + '|' + doc.querySelectorAll('#m-record li').length + '|'
+            + (stamped ? '1' : '0') + '|' + (first ? first.outerHTML : '');
+    }
+
     async function tick() {
         if (busy) return;
 
@@ -794,8 +822,7 @@
         // 列表还没渲染出来：先把接口请求发出去，DOM 一到就能立刻画
         if (!doc) { loadData(uid).catch(() => {}); return; }
 
-        const sig = uid + '|' + doc.querySelectorAll('#m-record li').length + '|' +
-            (doc.querySelector('#m-record li [data-res-id]') || {}).outerHTML;
+        const sig = sigOf(doc, uid);
         if (sig === lastSig) return;
 
         busy = true;
@@ -810,7 +837,8 @@
             const day = recordDaily(uid, data.week, data.all); // 两份都喂，与当前 tab 无关
             // 自己的主页不需要「我听了 N 次」，那栏本来就显示真实次数
             const hit = inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
-            lastSig = sig; // 标记这一版 DOM 已处理过，sig 一变（列表重渲染 / 切 tab）自然会重跑
+            // 画完再取一次指纹：这时才带上「已注入」的标记，下一轮不会重复跑
+            lastSig = sigOf(doc, uid);
             if (hit) hot = false; // 首屏画完就降频，只留余量跟 tab 切换
 
             // 首屏已经画上了，才轮到「我的次数」出场，不和排行请求抢带宽
@@ -861,5 +889,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.6.2 已加载');
+    console.info('[Creepy Monitor] v3.6.4 已加载');
 })();
