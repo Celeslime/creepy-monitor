@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.6.4
+// @version 3.7.0
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -171,6 +171,32 @@
             exact: !!comp && gap === 1 && clean,
             scaleMoved: moved, prevScale: moved ? baseSc : null, scale: sc || null,
         };
+    }
+
+    // 页头「累积听歌 N 首」是注册以来听过多少首不同的歌，按歌曲计、不按次数，
+    // 服务端只增不减。所以跨天相减就是「这期间第一次听到的歌」有几首。
+    // 它和排行那套差分是两条独立的线：排行只给 top100，这条不挑歌。
+    // 接口里同一个数叫 listenSongs（/api/v1/user/detail），用来核对语义
+    function recordHead(u, today, n) {
+        if (!Number.isFinite(n)) return null; // 页头还没渲染出来，不拿旧值充数
+        const prev = u.head;
+        if (!prev) { // 头一天只有基线，没有增量
+            u.head = { day: today, base: n, n };
+            return null;
+        }
+        if (prev.day === today) { // 同一天再看：计数会涨，增量跟着涨
+            if (n > prev.n) prev.n = n; // 同一版页面不会倒退，读到更小的值就当它没动
+            const d = prev.n - prev.base;
+            return d > 0 ? { n: prev.n, d, gap: prev.since ? daysBetween(prev.since, today) : 1 } : null;
+        }
+        // 跨天：上次记下的值成了今天的基线
+        u.head = { day: today, base: prev.n, n, since: prev.day };
+        const d = n - prev.n;
+        if (d <= 0) { // 这个数不会倒退，出现负的说明解析口径变了，就地重立基线
+            u.head.base = n;
+            return null;
+        }
+        return { n, d, gap: daysBetween(prev.day, today) };
     }
 
     // 某个 M 下，score → 次数 的反查表。格点从 1 起：能进榜就说明本周至少听过一次，
@@ -541,12 +567,13 @@
 
     // 两份数据各取所长，交给 applyObservation 合并：
     // 周榜反解覆盖「最近一周」tab，全时间真值覆盖「所有时间」tab，一份增量表两个 tab 通用
-    function recordDaily(uid, weekDs, allDs) {
+    function recordDaily(uid, weekDs, allDs, headN) {
         if (!CFG.DAILY) return null;
 
         const store = loadStore();
         const u = store.users[uid] || (store.users[uid] = { days: {} });
         const today = dayKey(new Date());
+        const head = recordHead(u, today, headN); // 页头那个计数和标尺无关，先记下
 
         const r = weekDs && weekDs.map.size ? resolveWeek(weekDs, allDs, u, today) : null;
         if (r && r.scale) weekDs.scale = r.scale; // describe 从这里取展示依据
@@ -555,7 +582,11 @@
         const al = {};
         if (allDs) for (const [id, info] of allDs.map) if (info.playCount > 0) al[id] = info.playCount;
         const wk = r ? r.wk : null;
-        if (!wk && !Object.keys(al).length) return null;
+        if (!wk && !Object.keys(al).length) {
+            // 排行这边没东西可算（榜单空 / 接口没回来），页头那个计数照样要落盘
+            saveStore(store);
+            return { counts: {}, warm: true, head };
+        }
 
         u.seen = Date.now();
         const res = applyObservation(u, today, wk || {}, al, r ? r.sc : null);
@@ -571,10 +602,10 @@
         saveStore(store);
 
         const time = new Date().toTimeString().slice(0, 5);
-        if (!res) return { counts: {}, time, exact: false, warm: true };
+        if (!res) return { counts: {}, time, exact: false, warm: true, head };
         return {
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds,
-            coldAll: res.coldAll, coldWeek: res.coldWeek,
+            coldAll: res.coldAll, coldWeek: res.coldWeek, head,
             time, exact: res.exact, gap: res.gap, est: r ? r.width : 0, bound: r ? r.bound : 0,
             scaleMoved: res.scaleMoved, prevScale: res.prevScale, scale: r ? r.sc : null,
         };
@@ -593,6 +624,19 @@
     const pickUid = s => {
         const m = s && /[?&]id=(\d+)/.exec(s);
         return m ? m[1] : null;
+    };
+
+    // 页头写的是「累积听歌3751首」，也可能带千分位或缩成万
+    function parseCount(s) {
+        const m = /(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(万)?/.exec(s || '');
+        if (!m) return null;
+        return Math.round(parseFloat(m[1].replace(/,/g, '')) * (m[2] ? 1e4 : 1));
+    }
+
+    // 页头那个数。自己插的尾巴在文本末尾，第一个数字永远是站点的
+    const headCount = doc => {
+        const el = doc.querySelector('#rHeader h4');
+        return el ? parseCount(el.textContent) : null;
     };
 
     // 不依赖 DOM 的 uid：列表还没渲染时也能先把数据抓回来。
@@ -716,8 +760,33 @@
         return errOf(data.week) <= errOf(data.all) ? data.week : data.all;
     }
 
+    // 「今天新听了几首」挂在页头那行后面。不碰站点的文字，只在 h4 内部末尾追加一个 span，
+    // 字号字体全继承，所以和「累积听歌3751首」是一句话读下来
+    function renderHead(doc, head) {
+        const el = doc.querySelector('#rHeader h4');
+        if (!el) return; // 新版播放器没有这个页头，或者页面还没渲染出来：安静跳过
+        let s = el.querySelector('.tm-head');
+        if (!head || !head.d) {
+            if (s) s.remove(); // 今天没有新歌：还原成站点原本的样子
+            return;
+        }
+        if (!s) {
+            s = doc.createElement('span');
+            s.className = 'tm-head';
+            s.style.cssText = 'margin-left:4px;'; // 只有间距，字体从 h4 继承
+            el.appendChild(s);
+        }
+        const text = `+${head.d}`;
+        const tip = head.gap > 1
+            ? `距上次记录 ${head.gap} 天，这 ${head.gap} 天一共新听 ${head.d} 首；累计听过 ${head.n} 首（本地记录）`
+            : `今天第一次听到 ${head.d} 首；累计听过 ${head.n} 首（本地记录，跨天才算得出）`;
+        if (s.textContent !== text) s.textContent = text;
+        if (s.title !== tip) s.title = tip;
+    }
+
     function inject(doc, ds, day, mine, self) {
         let hit = 0;
+        renderHead(doc, day && day.head);
         for (const li of doc.querySelectorAll('#m-record li')) {
             const res = li.querySelector('[data-res-id]');
             const tops = li.querySelector('.tops');
@@ -834,7 +903,8 @@
                 hot = false; // 这个人没有公开排行，别再高频空转
                 return;
             }
-            const day = recordDaily(uid, data.week, data.all); // 两份都喂，与当前 tab 无关
+            // 页头那个「累积听歌 N 首」不在列表里，顺手读一下，读不到就是 null
+            const day = recordDaily(uid, data.week, data.all, headCount(doc)); // 两份都喂，与当前 tab 无关
             // 自己的主页不需要「我听了 N 次」，那栏本来就显示真实次数
             const hit = inject(doc, pickDataset(doc, data), day, mineMap, uid === me.uid);
             // 画完再取一次指纹：这时才带上「已注入」的标记，下一轮不会重复跑
@@ -889,5 +959,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.6.4 已加载');
+    console.info('[Creepy Monitor] v3.7.0 已加载');
 })();
