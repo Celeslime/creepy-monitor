@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.7.1
+// @version 3.7.3
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -328,9 +328,26 @@
             if (!id) continue;
             const score = Number(it.score) || 0;
             scores.push(score);
-            map.set(String(id), { score, playCount: Number(it.playCount) || 0, name: it.song.name });
+            map.set(String(id), {
+                score,
+                playCount: Number(it.playCount) || 0,
+                name: it.song.name,
+                art: it.song.artists && it.song.artists[0] ? it.song.artists[0].name : '',
+            });
         }
         return { map, scores, scale: solveScale(scores) };
+    }
+
+    // 同一场录音常常挂着好几个 id：单曲版、专辑版各算一个，标题大小写还不一定一样。
+    // 「我听了 N 次」只按 id 对就会整行空着 —— 169 的 1808235517 是 2021 年的单曲，
+    // 我这边听的是专辑 NEGATIVE 里的 2063210044，同一段 146 秒的录音，两个 id。
+    // 所以另外留一份「歌名 + 首位歌手」的索引当后手，id 对不上时才查它
+    function nameKey(info) {
+        if (!info || !info.name) return '';
+        const n = String(info.name).toLowerCase().replace(/\s+/g, ' ').trim();
+        if (!n) return '';
+        const a = info.art ? String(info.art).toLowerCase().trim() : '';
+        return n + '\u0001' + a;
     }
 
     async function loadData(uid) {
@@ -359,7 +376,7 @@
     /* ---- 我自己：登录者 uid 与「最近一周听过几次」 ---- */
 
     const me = { asked: false, uid: null };
-    let mineMap = null; // songId -> 我最近一周的真实次数
+    let mineMap = null; // { byId, byName }：我最近一周的真实次数，byName 兜同名异 id
     let mineAt = 0;
 
     // 未登录时接口返回 account: null，不会抛错
@@ -375,19 +392,27 @@
     }
 
     // 本人账号的 playCount 是接口给的真值，不需要反解，也不受标尺饱和影响。
-    // 只要最近一周，不拉「全部时间」，省掉一次请求
+    // 只要最近一周，不拉「全部时间」，省掉一次请求。
+    // 注意不能复用 loadData 的缓存：那份走 type=-1，weekData 的 playCount 被
+    // 服务端清成 0（只有 score 是真数），拿来当「我听了 N 次」会一首歌都取不到。
+    // 3.5.0 把排行请求合并成 -1 之后，这条复用曾经让功能在看过自己主页后静默失效
     async function loadMine() {
         const hit = await getMe();
         if (!hit) return null;
+        if (mineMap && Date.now() - mineAt < CFG.CACHE_MS) return mineMap;
 
-        const cached = cache.get(hit);
-        const weekDs = cached && Date.now() - cached.t < CFG.CACHE_MS
-            ? cached.week
-            : buildDataset(await fetchRecord(hit, 1), 'weekData');
+        const weekDs = buildDataset(await fetchRecord(hit, 1), 'weekData');
 
-        const map = new Map();
-        for (const [id, info] of weekDs.map) if (info.playCount > 0) map.set(id, info.playCount);
-        mineMap = map.size ? map : null;
+        const byId = new Map();
+        const byName = new Map();
+        for (const [id, info] of weekDs.map) {
+            if (!(info.playCount > 0)) continue;
+            byId.set(id, info.playCount);
+            const k = nameKey(info);
+            if (k) byName.set(k, info.playCount);
+        }
+        if (!byId.size && weekDs.map.size) log('本人的 playCount 也是 0：服务端可能改了口径');
+        mineMap = byId.size ? { byId, byName } : null;
         mineAt = Date.now();
         return mineMap;
     }
@@ -870,7 +895,16 @@
 
             // 我最近一周听过这首歌几次：接口对我本人返回的是真数，不是估算。
             // 只是贴在右端的一行普通文字，和原版 .times 一起构成左右对称
-            const my = !self && mine ? mine.get(id) || 0 : 0;
+            let my = 0;
+            let byName = false;
+            if (!self && mine) {
+                my = mine.byId.get(id) || 0;
+                if (!my) { // 同一段录音的另一个版本：歌名一样、id 不同
+                    const k = nameKey(info);
+                    if (k) my = mine.byName.get(k) || 0;
+                    byName = my > 0;
+                }
+            }
             let mi = tops.querySelector('.tm-mine');
             if (my > 0) {
                 if (!mi) {
@@ -883,7 +917,9 @@
                     tops.appendChild(mi);
                 }
                 const myText = `我听了 ${my} 次`;
-                const myTip = `你最近 7 天听了这首歌 ${my} 次，取自本人账号接口的真实数据`;
+                const myTip = byName
+                    ? `你最近 7 天听了这首歌 ${my} 次。站内是另一版（单曲 / 专辑），ID 不同，这里按歌名认的`
+                    : `你最近 7 天听了这首歌 ${my} 次，取自本人账号接口的真实数据`;
                 if (mi.textContent !== myText) mi.textContent = myText;
                 if (mi.title !== myTip) mi.title = myTip;
             } else if (mi) {
@@ -988,5 +1024,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.7.0 已加载');
+    console.info('[Creepy Monitor] v3.7.3 已加载');
 })();
