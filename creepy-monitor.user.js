@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.7.3
+// @version 3.8.0
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -37,6 +37,14 @@
     // 站点公式（真实数据 100/100 验证）：score = floor(playCount * 100 / M)，M = 榜首次数
     // M >= 97 时格点步长 <= 1.031，必然覆盖 0..100，反解退化成常数 —— 标尺不可识别
     const SATURATION = 96;
+    // 格点步长 100/M 就是「一格百分比对应几次播放」。M 越大格子越粗，
+    // 同一份榜单能被越多个 M 解释 —— 反解给出的「最小可行值」就越可能只是巧合。
+    // 步长 1.1（M=91）是实测的转折点：再往上，sim 里那些 M=91~95 的账号
+    // 会被系统性地低估 10~20%，而这个区间的榜单本身确实区分不开
+    const GRAIN = 1.1;
+    const DENSE = Math.ceil(100 / GRAIN); // 91，反解的「稀疏线」
+    // M0 之后这么近的地方还有别的标尺也能解释榜单，就说不上「解出来了」
+    const AMBIGUOUS = 0.1;
     const SAT_MAX = 2000; // 饱和标尺的搜索上界：一周 2000 次以上就不再猜了
     const SAT_SLACK = 0.05; // 锁定的区间宽于 5% 就不算锁定，只报下界
     const STORE_KEY = 'tm_w163_daily_v1';
@@ -106,10 +114,11 @@
 
         if (!u.base) return null;
 
-        // 标尺换了，周榜这份快照就不是同一把尺子量出来的，相减得到的差值
-        // 主要是标尺本身的位移，不是他今天听了多少。这种天宁可空着。
-        // 旧存储没有 sc 字段，就拿昨天快照里的最大值（榜首次数）当它的标尺
+        // 标尺换了，周榜这份快照是不是同一把尺子量出来的，得看那天的次数定没定死。
+        // 旧存储没有 sc 字段，就拿昨天快照里的最大值（榜首次数）当它的标尺，
+        // 并把它当成「定没定死不可知」，保守处理
         let baseSc = u.base.sc;
+        let basePoint = false; // 那天的次数是不是唯一确定（区间退化成一个点）
         if (!baseSc) {
             const bw = u.base.week || {};
             const ks = Object.keys(bw);
@@ -118,9 +127,19 @@
                 for (const k of ks) if (bw[k] > mx) mx = bw[k];
                 baseSc = { lo: mx, hi: mx };
             }
+        } else {
+            basePoint = baseSc.hi !== null && baseSc.hi === baseSc.lo;
         }
-        const moved = !!(sc && baseSc && !sameScale(baseSc, sc));
+        const todayPoint = !!(sc && sc.hi !== null && sc.hi === sc.lo);
+
+        // 标尺变了不等于两天不可比。区间退化成一个点，说明那天是精确反解，
+        // 每首歌的次数就是真实次数本身 —— 榜首今天多听了 7 次把 M 从 29 顶到 36，
+        // 别人的次数并不因此改变，相减依然成立，只是那一格可能差一次。
+        // 只有靠先验锁在一段区间里的标尺（lo≠hi）才真的不能比
+        const same = !sc || !baseSc || sameScale(baseSc, sc);
+        const moved = !same && !(todayPoint && basePoint);
         if (moved) u.dirty = today; // 这天没记增量，7 天后的滑窗补偿会缺这一块，标出来
+        const shift = !same && !moved; // 跨了两把尺子相减：值照给，但这天不算精确
 
         const baseWeek = u.base.week || {};
         const baseAll = u.base.all || {};
@@ -168,8 +187,9 @@
         const clean = !u.dirty || daysBetween(u.dirty, today) >= 8;
         return {
             counts, fromAll, newIds, coldAll, coldWeek, gap,
-            exact: !!comp && gap === 1 && clean,
-            scaleMoved: moved, prevScale: moved ? baseSc : null, scale: sc || null,
+            exact: !!comp && gap === 1 && clean && !shift,
+            scaleMoved: moved, scaleShift: shift, prevScale: moved || shift ? baseSc : null,
+            scale: sc || null,
         };
     }
 
@@ -233,6 +253,17 @@
         return null;
     }
 
+    // M0 往后 10% 以内，还有没有别的标尺也能解释同一份榜单？
+    // 有，说明 M0 不是唯一解释 —— 榜单在这个尺度上分不出 89 和 127，
+    // 那个「最小可行值」只是碰巧最小，写次数就是编。
+    // 完整榜（每首都进榜）时最近的另一个标尺至少差 19%，截断稀疏榜却常常只差 1%，
+    // 10% 这条线就是实测出来的分界（见 test/sim.js 的饱和区统计）
+    function nearFit(uniq, M0) {
+        const top = Math.min(SAT_MAX, Math.ceil(M0 * (1 + AMBIGUOUS)));
+        for (let M = M0 + 1; M <= top; M++) if (fitsScale(uniq, M)) return M;
+        return null;
+    }
+
     // score 对应的次数区间：s = floor(100c/M)，解出 c ∈ [⌈s·M/100⌉, ⌈(s+1)·M/100⌉ − 1]
     // 下界从 1 起：能进榜就说明本周至少听过一次，score=0 不等于 0 次
     function bandOf(score, lo, hi) {
@@ -269,15 +300,28 @@
 
     // 软区间。周榜只给 score = floor(100c/M)，M ≥ 97 时格点铺满 0..100，
     // 单看一份榜单根本无从反解。但没动过的那批歌，prior 就是它的本周真实次数，
-    // 于是「谁的 prior 能倒出自己的 score」成了筛子，扫一遍就能把 M 卡成窄区间
+    // 于是「谁的 prior 能倒出自己的 score」成了筛子，扫一遍就能把 M 卡成窄区间。
+    // 命中数可能有几处并列的高点（一批歌今天没动、另一批昨天就估偏了），
+    // 只认其中最长的一段连续区间 —— 把不相邻的高点连起来会得到一个假的很宽的区间，
+    // 白白扔掉本来能锁定的那次机会
     function pinScale(pairs, start, end) {
         const top = Math.min(SAT_MAX, end || SAT_MAX);
-        let best = -1, lo = start, hi = start;
+        let best = 0;
+        let runFrom = -1; // 当前这段连续命中的起点
+        let lo = start, hi = start; // 目前最长的那段
         for (let M = start; M <= top; M++) {
             let hit = 0;
             for (const p of pairs) if (Math.floor(100 * p.prior / M) === p.score) hit++;
-            if (hit > best) { best = hit; lo = hi = M; }
-            else if (hit === best) hi = M;
+            if (hit > best) {
+                best = hit;
+                runFrom = M;
+                lo = hi = M;
+            } else if (hit > 0 && hit === best) {
+                if (runFrom < 0) runFrom = M;
+                if (M - runFrom > hi - lo) { lo = runFrom; hi = M; }
+            } else {
+                runFrom = -1;
+            }
         }
 
         // 大半对不上：今天这批歌基本都在涨，prior 已经不是次数了
@@ -485,7 +529,10 @@
     }
 
     // 用上一次的快照给周榜标尺定界。返回 null 表示没有先验可用；
-    // { hard } 表示只拿到下界；{ hard, lo, hi, counts, band } 表示把 M 卡进了窄区间
+    // 否则给出 { hard, prior, range, agree }：
+    // hard 是先验推出来的下界（播放不倒退，M 不可能比它小）；
+    // prior 是每首歌「今天没动的话应该是几次」，挑值时优先用它；
+    // range 是把 M 卡进的窄区间，null 表示只定住了下界。
     // capHi 是「本周次数不可能超过」的硬上界（榜首的终身次数 / 榜尾值）
     function pinWeek(u, weekDs, today, exactM, capHi) {
         const base = u.cur; // 上次访问留下的快照（applyObservation 之后才会推进成 base）
@@ -519,103 +566,154 @@
         // 再往下 pin 只会把上一把错尺子钉得更死，干脆整条链作废
         if (capHi !== null && hard > capHi) return null;
         // 精确反解没被下界证伪，就没必要再折腾
-        if (!sat && exactM >= hard) return { hard, ok: true };
+        if (!sat && exactM >= hard) return { hard, prior, range: null, agree: 0 };
 
         const pin = pinScale(pairs, hard, capHi === null ? SAT_MAX : capHi);
         if (pin.hi === null || pin.hi - pin.lo > Math.max(3, pin.lo * SAT_SLACK)) {
-            return { hard, lo: pin.lo, agree: pin.agree }; // 只定住下界
+            return { hard, prior, range: null, agree: pin.agree }; // 只定住下界
         }
+        // 命中段的两端都是估出来的（prior 本身带 ±1 的踩点误差），往里收着用会把
+        // 真值关在门外 —— 两端各留 1 次余量，显示成区间而不是一个点
+        return {
+            hard, prior, agree: pin.agree,
+            range: [Math.max(1, pin.lo - 1), pin.hi + 1],
+        };
+    }
 
-        // 每首歌的次数：先验落在区间里就取先验（那就是「今天没动」），否则取中点
+    // 每首歌的次数：给定标尺区间 [lo, hi]，逐行取带内最合理的值。
+    // 先验落在带里就用先验（那就是「今天没动」），否则取带中点；带只剩一个点就是它本身。
+    // 榜首的次数按定义就是 M，不用进格点
+    function countsFor(weekDs, lo, hi, M, prior) {
         const counts = new Map();
         const band = new Map();
         for (const [id, info] of weekDs.map) {
-            // 榜首的次数按定义就是 M 本身，不用再进格点
-            const [a, b] = info.score === 100 ? [pin.lo, pin.hi] : bandOf(info.score, pin.lo, pin.hi);
-            const p = prior.get(id);
-            counts.set(id, p !== undefined && p >= a && p <= b ? p : Math.round((a + b) / 2));
+            if (info.score === 100) {
+                counts.set(id, M);
+                band.set(id, [lo, hi]);
+                continue;
+            }
+            const [a, b] = bandOf(info.score, lo, hi);
+            const p = prior ? prior.get(id) : undefined;
+            counts.set(id, p !== undefined && p >= a && p <= b ? p : (a === b ? a : Math.round((a + b) / 2)));
             band.set(id, [a, b]);
         }
-        return { hard, lo: pin.lo, hi: pin.hi, counts, band, agree: pin.agree };
+        return { counts, band };
     }
 
     // 这次观测该用哪把尺子、每首歌算几次、拿什么当「当天标尺」记下来。
     // 只读两份数据集和昨天的状态，不碰存储，测试可以直接喂构造出来的对象。
-    // 返回的 scale 由调用方挂回 weekDs.scale —— describe 从那里取展示依据
+    // 返回的 scale 由调用方挂回 weekDs.scale —— describe 从那里取展示依据。
+    //
+    // 整体做法：每条证据只说明「M 必须落在哪一段」，最后求交，不再一条条改别人的结论。
+    // 格点反解给出 [M0, ∞)：硬下界，真实标尺一定让每个 score 都能命中；
+    // 榜首终身累计给出 [1, cap]：硬上界，本周次数不可能超过它的终身累计；
+    // 最近 7 天累加给出 [lo, ∞)：软下界，来自 days 里那串历史估算；
+    // 播放不倒退给出 [hard, ∞)：软下界；
+    // prior 命中段给出 [lo, hi]：软区间，没动过的那批歌 prior 就是本周次数。
+    // 硬证据互相矛盾就整条放弃；软证据与硬结论冲突时丢掉它，而不是反过来改硬结论。
+    // 以后再加一条证据，就是多交一个区间，不用回头调顺序
     function resolveWeek(weekDs, allDs, u, today) {
-        let scale = weekDs.scale;
+        const empty = { scale: null, wk: null, sc: null, width: 0, bound: 0 };
+        if (!weekDs || !weekDs.map.size) return empty;
+
         const uniq = [...new Set(weekDs.scores)];
-
-        // 榜首的终身累计 + 最近 7 天的累加，能把 M 直接夹住。这条路不经过标尺，
-        // 所以不受「昨天估错了 → 今天先验也错」的连累。上界还是硬的：M 越过它
-        // 就一定是尺子错了，下面任何一条路都不许再越过这个值
+        const M0 = weekDs.scale ? weekDs.scale.M : null; // 格点反解的最小可行标尺
         const anchor = anchorM(u, allDs, weekDs, today);
-        const capHi = anchor ? anchor.hi : null;
+        const cap = anchor ? anchor.hi : null;
 
-        // 标尺优先钉在上次的取值上 —— 但只在今天自己没有更好的证据的时候。
-        // 一次观测往往只定得住一段 [M, ∞)，每天各挑各的最小值，同一首歌的
-        // 次数就会随榜单稀疏度跳（38 跳到 89 = 今天听了 51 次），饱和时只能靠沿用。
-        // 可「旧值还能解释今天的榜单」这个判据对放大的尺子永远成立（可行集是
-        // [M, ∞)），错一次就再也纠不回来；反解能定住（M 小于饱和线）时它就是
-        // 硬下界，真实值不会比它小，那就必须让反解说。沿用前还要过一道硬上界
-        const solvedKnown = !!(scale && scale.M < SATURATION);
+        // 硬交集：两条都不依赖历史估算。打架说明这份观测本身对不上，宁可不说话
+        let box = [M0 === null ? 1 : M0, cap === null ? Infinity : cap];
+        if (box[0] > box[1]) return empty;
+
+        const pin = pinWeek(u, weekDs, today, M0, cap);
+        const prior = pin ? pin.prior : null;
         const prevM = u.cur && u.cur.sc ? u.cur.sc.lo : null;
-        const prevOk = !solvedKnown && prevM && (capHi === null || prevM <= capHi);
-        if (prevOk && scale && scale.M !== prevM && fitsScale(uniq, prevM)) {
-            scale = { M: prevM, countOf: countMapOf(prevM) };
-        }
-        if (scale && capHi !== null && scale.M > capHi) scale = null; // 反解或沿用值越界，宁可不给
 
-        const exactM = scale ? scale.M : null;
-        let anchored = false;
-        // 反解给出的 M 小于饱和线时，格点是认得出来的（真实值一定可行，最小可行值
-        // 就是下界），这时候直接用普通反解 —— 锚定的下界来自 days 那串历史估算，
-        // 上一把尺子偏大它就跟着偏大，没资格把反解顶上去。它只在反解不可用
-        // （饱和、或压根解不出）时才负责挑值，上界那道闸照旧
-        const exactKnown = exactM !== null && exactM < SATURATION;
-        if (!exactKnown && anchor && anchor.hi - anchor.lo <= Math.max(3, anchor.hi * SAT_SLACK)) {
-            for (let M = Math.max(1, anchor.lo); M <= anchor.hi; M++) {
-                if (!fitsScale(uniq, M)) continue;
-                scale = { M, countOf: countMapOf(M), anchor: { lo: anchor.lo, hi: anchor.hi } };
-                anchored = true;
+        let M = M0;
+        let lo = box[0], hi = box[1];
+        let width = 0, bound = 0, path = '', lockBy = '', loose = false;
+
+        // ① 反解在饱和线以下：格点够细，最小可行值就是它，不必找别的解释。
+        // 这一步必须最先生效 —— 上一把尺子错了，先验也会跟着错，
+        // 让它去顶反解就再也纠不回来（3.7.1 那个 175 次就是这么来的）
+        if (M0 !== null && M0 < SATURATION) {
+            M = M0; lo = hi = M0; path = 'solve';
+            // 先验反过来证伪了反解（历史次数显示榜首至少听了这么多），
+            // 那就只把这个下界说出来，不改数字
+            if (pin && pin.hard > M0) bound = pin.hard;
+            // 附近还有别的标尺能解释这份榜单时，M0 就只是「碰巧最小的那个」
+            loose = !!nearFit(uniq, M0);
+        }
+
+        // ② 反解不可辨识：看历史先验能不能把区间收窄到 5% 以内。
+        // 候选按「具体程度」排：命中段最硬（它同时用上了每一首歌），
+        // 锚定次之，纯下界最后
+        if (!path) {
+            const cand = [];
+            if (pin && pin.range) cand.push({ name: 'pin', box: pin.range });
+            if (anchor) cand.push({ name: 'anchor', box: [Math.max(1, anchor.lo), anchor.hi] });
+            if (pin && pin.hard > box[0]) cand.push({ name: 'prior', box: [pin.hard, box[1]] });
+            for (const c of cand) {
+                const a = Math.max(box[0], c.box[0]);
+                const b = Math.min(box[1], c.box[1]);
+                if (a > b) continue; // 与硬证据冲突，丢掉这条
+                if (b === Infinity) continue; // 只有下界，收窄不了
+                if (b - a > Math.max(3, a * SAT_SLACK)) continue; // 太宽，不算锁定
+                lo = a; hi = b; M = a;
+                width = Math.ceil((hi - lo) / 2);
+                path = 'lock'; lockBy = c.name;
                 break;
             }
         }
 
-        const exactOk = exactM !== null && (exactM < SATURATION || anchored);
-        const pin = !anchored && weekDs.map.size ? pinWeek(u, weekDs, today, exactM, capHi) : null;
-        // 精确解落在锁定区间里就信精确解；落在外面说明它被下界证伪了
-        const usePin = !!(pin && pin.counts && !(exactOk && exactM >= pin.lo && exactM <= pin.hi));
+        // ③ 还是定不下来：沿用上次那把尺子。它只能在这个区间里挑值 ——
+        // 过了上界就作废，也不许改写 ① 的结论
+        if (!path) {
+            const ok = prevM !== null && prevM >= box[0]
+                && (box[1] === Infinity || prevM <= box[1]) && fitsScale(uniq, prevM);
+            if (ok) {
+                M = prevM; lo = prevM; hi = Infinity; path = 'prev';
+            }
+        }
 
-        let wk = null;
-        let width = 0; // 这份次数的误差半径，0 表示精确反解
-        let bound = pin && !usePin && pin.hard > (exactOk ? exactM : 0) ? pin.hard : 0;
+        // ④ 什么都没有：拿反解下界当点估计，并说清楚它只是下界
+        if (!path) {
+            M = box[0]; lo = M; hi = Infinity; path = 'lower';
+            if (pin && pin.hard > M) bound = pin.hard;
+        }
 
-        if (usePin) {
+        let wk = null, keptPin = null;
+        if (path === 'lock') {
+            // 区间里逐首挑值，先验优先
+            const { counts, band } = countsFor(weekDs, lo, hi, M, prior);
             wk = {};
-            for (const [id, c] of pin.counts) wk[id] = c;
-            width = Math.ceil((pin.hi - pin.lo) / 2); // 区间退化成一点时 width=0，当作精确值
-            scale = scale || { M: SATURATION, countOf: new Map() };
-        } else if (scale) {
-            // 标尺只定得住下界（榜单里有 score=0 就说明 M ≥ 101），单个次数不可信，
-            // 但两天用同一把尺子时差分仍然成立，只是尺度整体可能缩水。
-            // 存下来，明天才有东西可比
+            for (const [id, c] of counts) wk[id] = c;
+            keptPin = { lo, hi, counts, band };
+        } else {
+            // 点估计：按反解查表。两天用同一把尺子时差分仍然成立，
+            // 只是尺度整体可能缩水，所以照样存下来，明天才有东西可比
+            const countOf = countMapOf(M);
             wk = {};
             for (const [id, info] of weekDs.map) {
-                const c = scale.countOf.get(info.score);
+                const c = countOf.get(info.score);
                 if (c !== undefined) wk[id] = c;
             }
         }
 
-        // 记下这次实际用的是哪把尺子，明天要比对：换了尺子的两天不能相减
-        const sc = usePin
-            ? { lo: pin.lo, hi: pin.hi === null ? null : pin.hi }
-            : (anchored ? { lo: scale.anchor.lo, hi: scale.anchor.hi }
-                : (exactOk ? { lo: exactM, hi: exactM }
-                    : (scale ? { lo: scale.M, hi: null } : null)));
+        // 记下这次用的是哪把尺子，明天要比对：换了尺子的两天不能相减
+        const sc = hi === Infinity ? { lo: M, hi: null } : { lo, hi };
 
-        // pin 只挂在 scale 上给 describe 用，顺手拷一份，别改到传进来的数据集
-        if (scale) scale = Object.assign({}, scale, { pin: usePin ? pin : null });
+        // pin 和 anchor 只挂在 scale 上给 describe 用。拷一份，别改到传进来的数据集。
+        // anchor 只在它真正参与了锁定的时候才挂 —— 否则 describe 会以为这个 M 是
+        // 被榜首终身次数夹出来的，把「只是下界」的估计当成精确值显示
+        const scale = Object.assign({}, weekDs.scale || {}, {
+            M,
+            countOf: countMapOf(M),
+            pin: keptPin,
+            anchor: lockBy === 'anchor' ? { lo: anchor.lo, hi: anchor.hi } : undefined,
+            loose, // 这个 M 只是众多解释里最小的那个，不能当精确值用
+            why: path + (lockBy ? ':' + lockBy : ''), // 走了哪条路，出问题时看这个
+        });
         return { scale, wk, sc, width, bound };
     }
 
@@ -661,7 +759,8 @@
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds,
             coldAll: res.coldAll, coldWeek: res.coldWeek, head,
             time, exact: res.exact, gap: res.gap, est: r ? r.width : 0, bound: r ? r.bound : 0,
-            scaleMoved: res.scaleMoved, prevScale: res.prevScale, scale: r ? r.sc : null,
+            scaleMoved: res.scaleMoved, scaleShift: res.scaleShift,
+            prevScale: res.prevScale, scale: r ? r.sc : null,
         };
     }
 
@@ -713,11 +812,12 @@
         if (info.playCount > 0) {
             r = { text: `${info.playCount}次`, tip: `播放 ${info.playCount} 次（接口返回的真实数据）` };
         } else {
-            // 被锚住的标尺即使大于 96 也是可用的 —— 它不是靠反解猜的，是拿榜首的
-            // 终身累计和最近 7 天的累加夹出来的
-            const sat = !scale || (scale.M >= SATURATION && !scale.anchor);
+            // 标尺可信的两条路：被锚住的（榜首终身次数 + 最近 7 天累加夹出来的，
+            // 不靠反解猜），或者格点够细、附近也没有第二种解释。除此之外一律按占比显示，
+            // 这时写次数就是编
+            const sat = !scale || (!scale.anchor && (scale.M >= DENSE || !!scale.loose));
             const solved = scale && scale.countOf.has(info.score) ? scale.countOf.get(info.score) : null;
-            const pin = scale && scale.pin; // 饱和标尺被历史次数锁定时的区间估计
+            const pin = scale && scale.pin; // 标尺被历史次数锁定时的区间估计
             const pinned = pin && pin.counts ? pin.counts.get(info.id) : undefined;
 
             if (CFG.MODE !== 'percent' && pinned !== undefined) {
@@ -729,7 +829,7 @@
             } else if (CFG.MODE === 'count' && scale) {
                 r = solved !== null && !sat
                     ? { text: `${solved}次`, tip: `格点反解，M=${scale.M}` }
-                    : { text: `≥${bound || scale.M}次`, tip: `标尺饱和，只定得住下界，真实值可能远高于此` };
+                    : { text: `≥${bound || scale.M}次`, tip: `标尺太粗，只定得住下界，真实值可能远高于此` };
             } else if (CFG.MODE !== 'percent' && solved !== null && !sat) {
                 r = {
                     text: `${solved}次`,
@@ -738,7 +838,8 @@
                             + `，标尺锁在 M=${scale.M}`
                         : (bound
                             ? `格点反解给出 M=${scale.M}，但历史次数显示至少 ${bound} 次，这个标尺偏小了`
-                            : `格点反解得到唯一标尺 M=${scale.M}，次数可信`),
+                            // 榜单只能把 M 卡到 1% 上下，说「唯一」是过头了
+                            : `格点反解的最小可行标尺 M=${scale.M}，次数按它推算，误差在 1% 上下`),
                 };
             } else if (CFG.ASSUME_TOP_COUNT > 0) {
                 const M = CFG.ASSUME_TOP_COUNT;
@@ -749,7 +850,12 @@
                 const low = bound
                     ? `；榜首本周至少 ${bound} 次（靠昨天的次数卡出来的下界）`
                     : (scale ? `，反解只能确定榜首 ≥${scale.M} 次` : '');
-                r = { text: `${info.score}%`, tip: `占榜首播放量的 ${info.score}%${low}` };
+                // 占比不误导，但信息量低。把「按最小可行标尺推的话是多少」放进悬停，
+                // 想深究的人能看到数，不想深究的人不会被一个可能偏小的数骗到
+                const est = solved !== null && scale && !scale.anchor
+                    ? `；若按最小可行标尺 M=${scale.M} 推算约 ${solved} 次，但更大的标尺同样解释得通`
+                    : '';
+                r = { text: `${info.score}%`, tip: `占榜首播放量的 ${info.score}%${low}${est}` };
             }
         }
 
@@ -763,16 +869,16 @@
                 r.deltaTip = `今天新进榜，本周累计 ${n} 次（今日上限，可能含前几天的播放）`;
             } else if (n > 0) {
                 const truth = day.fromAll && day.fromAll.has(info.id);
-                const src = truth
-                    ? (day.gap === 1 ? '全时间榜真值差分' : `全时间榜真值差分但跨了 ${day.gap} 天`)
-                    : day.est
-                        ? `周榜标尺靠历史次数锁定，误差 ±${day.est} 次`
-                        : (day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差');
+                let src;
+                if (truth) src = day.gap === 1 ? '全时间榜真值差分' : `全时间榜真值差分但跨了 ${day.gap} 天`;
+                else if (day.scaleShift) src = `周榜反解差分，标尺从 ${fmtScale(day.prevScale)} 变成 ${fmtScale(day.scale)}，可能差一格`;
+                else if (day.est) src = `周榜标尺靠历史次数锁定，误差 ±${day.est} 次`;
+                else src = day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差';
                 r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
                 r.deltaTip = `今日新增 ${n} 次（${day.time} 观测，${src}）`;
             } else if (day.scaleMoved) {
                 r.tip += `；周榜标尺从 ${fmtScale(day.prevScale)} 变成 ${fmtScale(day.scale)}`
-                    + '，两天不在同一把尺子上，这天的周榜增量先不记';
+                    + '，两天的次数都只锁在区间里，相减没有意义，这天的周榜增量先不记';
             } else if (day.coldWeek) {
                 r.tip += '；周榜基线今天才建立（昨天的标尺没解出来），明天起这一页才有增量';
             } else if (day.coldAll) {
@@ -1024,5 +1130,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.7.3 已加载');
+    console.info('[Creepy Monitor] v3.8.0 已加载');
 })();

@@ -29,13 +29,24 @@
         return d && d.querySelector('#m-record') ? d : null;
     }
 
-    // 周榜只给 score（占榜首的百分比），反推最小标尺 M，使每条 score 都能被 floor(100*i/M) 命中
+    // 周榜只给 score（占榜首的百分比），反推最小标尺 M，使每条 score 都能被 floor(100*i/M) 命中。
+    // loose：M 之后 10% 以内还有别的 M 也能命中。那种情况下这个最小值只是碰巧最小，
+    // 真实标尺可能大得多（实测一份真值 127 的榜单，89 也能解释它），不能当次数用
     function solve(scores) {
-        for (let M = 1; M <= 100; M++) {
+        const tryM = M => {
             const at = new Map();
             // 倒着填，小 i 后写入，取到的就是该 score 的最小次数
             for (let i = M; i >= 0; i--) at.set(Math.floor(100 * i / M), i);
-            if (scores.every(s => at.has(s))) return { M, at };
+            return scores.every(s => at.has(s)) ? at : null;
+        };
+        for (let M = 1; M <= 100; M++) {
+            const at = tryM(M);
+            if (!at) continue;
+            let loose = false;
+            for (let m = M + 1; m <= Math.ceil(M * 1.1) && !loose; m++) {
+                if (tryM(m)) loose = true;
+            }
+            return { M, at, loose };
         }
         return null;
     }
@@ -69,7 +80,7 @@
         const src = hit('all') >= hit('week') ? data.all : data.week;
         const real = src === data.all; // 全时间榜的 playCount 是服务端真值
         const scale = real ? null : solve([...src.values()].map(v => v.score));
-        const sat = !real && (!scale || scale.M >= SATURATION);
+        const sat = !real && (!scale || scale.M >= SATURATION || scale.loose);
 
         for (const li of lis) {
             const tops = li.querySelector('.tops');
@@ -81,7 +92,7 @@
             const el = doc.createElement('span');
             el.className = 'times f-ff2'; // 原版类名，样式由站点 CSS 提供
             el.textContent = text;
-            el.title = real ? `播放 ${info.count} 次（接口真值）` : (sat ? '标尺饱和，只能给占比' : '按条形宽度反解');
+            el.title = real ? `播放 ${info.count} 次（接口真值）` : (sat ? '标尺太粗，附近好几个 M 都解释得通，只给占比' : '按条形宽度反解');
             tops.appendChild(el);
         }
     }

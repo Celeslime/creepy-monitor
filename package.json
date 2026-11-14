@@ -1,0 +1,14 @@
+{
+  "name": "creepy-monitor",
+  "version": "3.8.0",
+  "private": true,
+  "description": "网易云听歌排行：补真实播放次数与每日增量",
+  "scripts": {
+    "test": "node test/run.js",
+    "sim": "node test/sim.js",
+    "verify": "node test/run.js && node test/sim.js"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}
