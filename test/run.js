@@ -8,6 +8,7 @@ const SUITES = [
     'window-slide',
     'scale-decide',
     'scale-shift',
+    'revisit',
     'anchor',
     'head-count',
     'mine-listen',

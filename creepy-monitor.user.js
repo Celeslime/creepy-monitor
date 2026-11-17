@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.8.0
+// @version 3.8.1
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -47,6 +47,12 @@
     const AMBIGUOUS = 0.1;
     const SAT_MAX = 2000; // 饱和标尺的搜索上界：一周 2000 次以上就不再猜了
     const SAT_SLACK = 0.05; // 锁定的区间宽于 5% 就不算锁定，只报下界
+    // 增量算得准不准，取决于两次观测是不是真的隔了一天。周榜是 7 天窗口，
+    // 补偿项 days[today-7] 是一整天的量：只隔了 12 小时就把一整天的旧播放
+    // 加回来，多出来的那半天会算进今天（见 test/sim-hourly.js）。
+    // 日历天看不出来这个 —— 23:50 和次日 00:10 都是 gap=1 —— 所以另记时间戳
+    const EXACT_SPAN = 3 * 3600000; // 相隔 24 小时 ±3 小时才算精确
+    const DAY_MS = 86400000;
     const STORE_KEY = 'tm_w163_daily_v1';
 
     const log = (...a) => CFG.DEBUG && console.log('[Creepy Monitor]', ...a);
@@ -93,7 +99,7 @@
     function applyObservation(u, today, wk, al, sc) {
         if (!u.days) u.days = {};
 
-        const now = { day: today, week: wk, all: al };
+        const now = { day: today, week: wk, all: al, t: Date.now() };
         if (sc) now.sc = sc;
         if (!u.cur) { // 首次：只存基线，没有差值可算
             u.cur = now;
@@ -101,6 +107,7 @@
         }
 
         let gap = 0;
+        const sameDayObs = u.cur.day === today; // 同一天再看一次：基线不动
         if (u.cur.day !== today) { // 跨天：把上一份快照固化为基线
             gap = daysBetween(u.cur.day, today);
             if (gap !== 1) u.dirty = today; // 漏访会在 7 天内污染差分链条
@@ -109,6 +116,7 @@
         } else { // 同一天重复访问：只刷新当日快照
             u.cur.week = wk;
             u.cur.all = al;
+            u.cur.t = now.t; // 明天作基线时，这一份的时间戳要跟上
             if (sc) u.cur.sc = sc;
         }
 
@@ -180,14 +188,33 @@
             }
         }
 
+        // 同一天再看一次：两次算的都是「从昨天那次观测到现在」。后一次万一没算出
+        // 周榜（标尺被判不可比、或榜单空了一格），整表替换会把前面已经算好的增量
+        // 整行抹掉，页面上的 +n 会凭空消失。所以只补上后一次没覆盖到的行，
+        // 不拿旧值去覆盖新值 —— 新值更接近现在，哪怕它因为量化比旧的少一格
+        const prevDay = sameDayObs ? u.days[today] : null;
+        if (prevDay) {
+            for (const [id, n] of Object.entries(prevDay)) {
+                if (!(id in counts)) counts[id] = n;
+            }
+        }
         u.days[today] = counts;
         pruneDays(u, today);
 
-        // 只有「补偿项在手 + 昨天确实访问过 + 最近 8 天没漏访」才算精确
+        // 只有「补偿项在手 + 基线真的隔了约一天 + 最近 8 天没漏访」才算精确。
+        // 间隔那个条件不能只看日历天：一天看两三次时，头一次离昨天那次可能只有
+        // 十来个小时，gap 照样是 1，而补偿项是一整天的量。旧存储没有时间戳，
+        // 那时候退回只看日历天
         const clean = !u.dirty || daysBetween(u.dirty, today) >= 8;
+        const spanOk = u.base.t
+            ? Math.abs(now.t - u.base.t - DAY_MS) <= EXACT_SPAN
+            : gap === 1;
         return {
             counts, fromAll, newIds, coldAll, coldWeek, gap,
-            exact: !!comp && gap === 1 && clean && !shift,
+            // 这份增量实际跨了几天：同一天重访时 gap 是 0，但差值仍是从 base 那天算起的，
+            // 悬停里说「跨了 0 天」就露馅了
+            baseGap: u.base ? daysBetween(u.base.day, today) : gap,
+            exact: !!comp && spanOk && clean && !shift,
             scaleMoved: moved, scaleShift: shift, prevScale: moved || shift ? baseSc : null,
             scale: sc || null,
         };
@@ -758,7 +785,8 @@
         return {
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds,
             coldAll: res.coldAll, coldWeek: res.coldWeek, head,
-            time, exact: res.exact, gap: res.gap, est: r ? r.width : 0, bound: r ? r.bound : 0,
+            time, exact: res.exact, gap: res.gap, baseGap: res.baseGap,
+            est: r ? r.width : 0, bound: r ? r.bound : 0,
             scaleMoved: res.scaleMoved, scaleShift: res.scaleShift,
             prevScale: res.prevScale, scale: r ? r.sc : null,
         };
@@ -870,7 +898,7 @@
             } else if (n > 0) {
                 const truth = day.fromAll && day.fromAll.has(info.id);
                 let src;
-                if (truth) src = day.gap === 1 ? '全时间榜真值差分' : `全时间榜真值差分但跨了 ${day.gap} 天`;
+                if (truth) src = day.baseGap === 1 ? '全时间榜真值差分' : `全时间榜真值差分但跨了 ${day.baseGap} 天`;
                 else if (day.scaleShift) src = `周榜反解差分，标尺从 ${fmtScale(day.prevScale)} 变成 ${fmtScale(day.scale)}，可能差一格`;
                 else if (day.est) src = `周榜标尺靠历史次数锁定，误差 ±${day.est} 次`;
                 else src = day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差';
@@ -1130,5 +1158,5 @@
 
     window.addEventListener('hashchange', kick);
     run();
-    console.info('[Creepy Monitor] v3.8.0 已加载');
+    console.info('[Creepy Monitor] v3.8.1 已加载');
 })();
