@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name 隔墙有耳 · Creepy Monitor
 // @namespace https://github.com/Celeslime/creepy-monitor
-// @version 3.8.1
+// @version 3.8.2
 // @description 在用户主页「听歌排行」里补上真实播放次数，并靠周榜差分维护每人每天的听歌增量
 // @author Cele
 // @match https://music.163.com/*
@@ -53,6 +53,7 @@
     // 日历天看不出来这个 —— 23:50 和次日 00:10 都是 gap=1 —— 所以另记时间戳
     const EXACT_SPAN = 3 * 3600000; // 相隔 24 小时 ±3 小时才算精确
     const DAY_MS = 86400000;
+    const COMP_TOL = 3; // 小时。补偿项那格的实际跨度与这次差太多就等于没补
     const STORE_KEY = 'tm_w163_daily_v1';
 
     const log = (...a) => CFG.DEBUG && console.log('[Creepy Monitor]', ...a);
@@ -80,6 +81,8 @@
     function pruneDays(u, today) {
         const floor = shiftDay(today, -7);
         for (const k of Object.keys(u.days)) if (k < floor) delete u.days[k];
+        if (u.spans) for (const k of Object.keys(u.spans)) if (k < floor) delete u.spans[k];
+        if (u.bad) for (const k of Object.keys(u.bad)) if (k < floor) delete u.bad[k];
     }
 
     // 一次观测：wk 是周榜反解出的 {songId: 本周次数}，al 是全时间榜的 {songId: 真实累计次数}
@@ -153,10 +156,25 @@
         const baseAll = u.base.all || {};
         const coldAll = !Object.keys(baseAll).length; // 全时间基线还没建立（升级 / 首次）
         const coldWeek = !Object.keys(baseWeek).length; // 周榜基线还没建立（那天标尺没解出来）
-        const comp = u.days[shiftDay(today, -7)] || null; // 7 天前的日增量
+        // 补偿项是「那一格当时跨了多久」的量，不是「一整天」的量。只有这次的
+        // 跨度跟它差不多长，7 天前滑出窗口的才是同一段 —— 23:40 还在看、次日
+        // 00:10 又打开，日历年翻了一页，实际只滑出 20 分钟，按整天补等于把 7 天
+        // 前那一整天听的全搬过来（真实数据里 typhoon 就这样冒出 +28）
+        const compDay = shiftDay(today, -7);
+        const comp = u.days[compDay] || null; // 7 天前的日增量
+        const compSpan = u.spans && u.spans[compDay] != null ? u.spans[compDay] : 24; // 旧存储没记跨度，按整天算
+        const compBad = !!(u.bad && u.bad[compDay]); // 那一格当时缺了行，不在表里的说不清是「没听」还是「没算出来」
+        const spanH = u.base.t
+            ? (now.t - u.base.t) / 3600000
+            : Math.max(1, daysBetween(u.base.day, today)) * 24; // 旧快照没时间戳，退回日历天
+        const compSpanOk = !!comp && Math.abs(compSpan - spanH) <= COMP_TOL;
         const counts = {};
         const fromAll = new Set();
         const newIds = new Set(); // 今天新进榜、没有基线的歌
+        const uncertain = new Set(); // 补偿对不上、宁可不出数的行
+        // 这一次的周榜到底算没算出来。算出来 = 榜单拿到了、标尺没判不可比，
+        // 此时整张周榜就是权威，没出现在 counts 里的行各有各的原因，不能拿旧的补
+        const weekDone = !moved && !coldWeek && Object.keys(wk).length > 0;
 
         // 1) 全时间榜：两边都在榜才有差分可言。新进榜的歌不知道之前累计多少，
         // 拿 0 当基线会把它一生的播放量都算成今天听的（几百次），只能跳过
@@ -183,6 +201,15 @@
                 // 落在同一个 score 上），这时拿那天的增量当它的下界，否则补偿项
                 // 会被整个加回来，算出「本周 2 次、今日 +3」这种自相矛盾的值
                 const c7 = comp ? (comp[id] || 0) : 0;
+                // 那一格缺过行时，「不在表里」既可能是没听过，也可能是当时没算出
+                // 来，分不开，只能不出数；在表里的行值本身是对的，照用
+                const c7Known = !compBad || (comp && (id in comp));
+                // 补偿项的宽度得跟这次跨度对得上，否则等于拿整天量补一小段。
+                // 对不上时 c7=0 的行免疫：没听过就滑不出东西，0 乘任何比例还是 0
+                if (!c7Known || (!compSpanOk && c7 > 0)) {
+                    uncertain.add(id);
+                    continue;
+                }
                 const d = wk[id] - Math.max(baseWeek[id], c7) + c7;
                 counts[id] = Math.max(0, d); // 掉出榜单导致的负值钳到 0
             }
@@ -192,13 +219,26 @@
         // 周榜（标尺被判不可比、或榜单空了一格），整表替换会把前面已经算好的增量
         // 整行抹掉，页面上的 +n 会凭空消失。所以只补上后一次没覆盖到的行，
         // 不拿旧值去覆盖新值 —— 新值更接近现在，哪怕它因为量化比旧的少一格
-        const prevDay = sameDayObs ? u.days[today] : null;
+        //
+        // 但补行有个前提：这一次确实没算出周榜。周榜算出来了就以它为准，否则
+        // 补回来的恰恰是两样不该有的东西：被补偿闸门藏起来的行（它们本来就
+        // 不该出数，补一下就等于闸门白装），以及已经滑出榜单的歌（周榜不在表
+        // 里就是这周 0 次，补回上午的旧值等于让一个归零的数赖着不走）
+        const prevDay = sameDayObs && !weekDone ? u.days[today] : null;
         if (prevDay) {
             for (const [id, n] of Object.entries(prevDay)) {
                 if (!(id in counts)) counts[id] = n;
             }
         }
         u.days[today] = counts;
+        // 这一格里周榜的数字是在多大跨度下算出来的。同日重访时跨度会变长，
+        // 只有真的重算过周榜才跟着改，否则留着上一次算它时的跨度
+        if (!u.spans) u.spans = {};
+        if (!u.bad) u.bad = {};
+        if (weekDone) { // 没重算周榜时这两个字段跟着上一份走，不能拿空结果覆盖
+            u.spans[today] = Math.round(spanH * 10) / 10;
+            if (uncertain.size) u.bad[today] = 1; else delete u.bad[today];
+        }
         pruneDays(u, today);
 
         // 只有「补偿项在手 + 基线真的隔了约一天 + 最近 8 天没漏访」才算精确。
@@ -210,7 +250,8 @@
             ? Math.abs(now.t - u.base.t - DAY_MS) <= EXACT_SPAN
             : gap === 1;
         return {
-            counts, fromAll, newIds, coldAll, coldWeek, gap,
+            counts, fromAll, newIds, coldAll, coldWeek, gap, uncertain,
+            spanH, compSpan, compSpanOk,
             // 这份增量实际跨了几天：同一天重访时 gap 是 0，但差值仍是从 base 那天算起的，
             // 悬停里说「跨了 0 天」就露馅了
             baseGap: u.base ? daysBetween(u.base.day, today) : gap,
@@ -786,6 +827,7 @@
             counts: res.counts, fromAll: res.fromAll, newIds: res.newIds,
             coldAll: res.coldAll, coldWeek: res.coldWeek, head,
             time, exact: res.exact, gap: res.gap, baseGap: res.baseGap,
+            uncertain: res.uncertain, spanH: res.spanH, compSpan: res.compSpan,
             est: r ? r.width : 0, bound: r ? r.bound : 0,
             scaleMoved: res.scaleMoved, scaleShift: res.scaleShift,
             prevScale: res.prevScale, scale: r ? r.sc : null,
@@ -904,6 +946,11 @@
                 else src = day.exact ? '周榜反解差分' : '周榜反解差分，含窗口滑出的估算误差';
                 r.delta = `+${n}`; // 交给子元素渲染，紧贴数字之后
                 r.deltaTip = `今日新增 ${n} 次（${day.time} 观测，${src}）`;
+            } else if (day.uncertain && day.uncertain.has(info.id)) {
+                // 补偿项是 7 天前那一整格的量。这次只跨了几个小时还按整天补，
+                // 等于把那天的播放整块搬过来，所以这一行干脆不出数
+                r.tip += `；7 天前那格跨了 ${(+day.compSpan.toFixed(1))} 小时，这次跨了 `
+                    + `${(+day.spanH.toFixed(1))} 小时，滑出窗口的量对不上，这行的增量先不给`;
             } else if (day.scaleMoved) {
                 r.tip += `；周榜标尺从 ${fmtScale(day.prevScale)} 变成 ${fmtScale(day.scale)}`
                     + '，两天的次数都只锁在区间里，相减没有意义，这天的周榜增量先不记';

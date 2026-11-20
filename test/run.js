@@ -9,6 +9,7 @@ const SUITES = [
     'scale-decide',
     'scale-shift',
     'revisit',
+    'span-comp',
     'anchor',
     'head-count',
     'mine-listen',

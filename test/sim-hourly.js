@@ -10,11 +10,25 @@
 // 日历天（gap）：23:50 和次日 00:10 只差 20 分钟，gap 也是 1。这份仿真就是来量这个缝。
 //
 // --window 保留两档，day 只作对照（自然日窗口下补偿项跟观测钟点无关）：
-//   rolling  最近 168 小时（真滑动，站点的实际口径）
-//   day      最近 7 个自然日（按日期切）
+// rolling 最近 168 小时（真滑动，站点的实际口径）
+// day 最近 7 个自然日（按日期切）
 //
-//   node test/sim-hourly.js [--accounts 4] [--days 24] [--every 6] [--jitter 0.6]
-//                           [--window rolling|day] [--seed 1] [--verbose]
+// v3.8.2 起跨度跟 7 天前那格对不上的行不再出数，这里单独统计「被藏起来」的行数 ——
+// 只看平均误差会被隐藏掉的行骗：藏得越多，剩下的行越准。
+//
+// 四条硬账（不加 --strict 也判失败）：
+// allWrong：全时间榜的真值差分，任何情况下都该分毫不差
+// shrink：同日重访、周榜没算出来时，把上午已经算好的行弄丢了
+// badGap：同日重访的悬停写「跨了 0 天」
+// leak：今天的榜里都没有这首，页面上却还挂着正数（补行补过头了）
+// 另有两条只报数不判失败：flip（同一天两次观测之间没听、数字却变了）、supp（被藏起来的行）。
+//
+// --clump 让听歌成簇（一天只在一两个时段听）。匀着听时每首歌每小时最多滑出 1 次，
+// 撞不到真实那种「一整坨一起滑出 168 小时窗口」——真实那份存储里 11-13 早上 20
+// 分钟里 typhoon 听了 9 次。
+//
+// node test/sim-hourly.js [--accounts 4] [--days 24] [--every 6] [--jitter 0.6]
+// [--window rolling|day] [--clump] [--seed 1] [--verbose]
 const { load, makeStorage, makeClock } = require('./lib/harness');
 
 const argv = process.argv.slice(2);
@@ -41,6 +55,11 @@ const SCRIPT_PATH = strOf('script', '');
 const DEBUG_DAY = argOf('debug', 0);
 // --trace：逐次打印观测（时间、基线、gap、是否精确），排查时序问题用
 const TRACE = argv.includes('--trace');
+// --clump：听歌成簇（一天只在一两个时段听），而不是匀在整天里。真实用户就是
+// 这样：真实那份存储里 11-13 早上 20 分钟里 typhoon 听了 9 次、雪落成盐 14 次，
+// 168 小时窗口边界扫过那一段时是一整坨一起滑出去。匀着听的仿真碰不到这个，
+// 每首歌每小时滑出量最多 1，误差看起来总是「差一格」。
+const CLUMP = argv.includes('--clump');
 
 if (WINDOW !== 'rolling' && WINDOW !== 'day') {
     console.error('--window 只认 rolling 或 day');
@@ -121,6 +140,7 @@ function makeAccount(profile, rnd) {
     let dayTarget = 0, targetDay = -1;
 
     // 逐小时推进，保证时间轴严格有序（周榜窗口要靠它算）
+    let sessHours = null;
     const ensure = upto => {
         for (let h = through + 1; h <= upto; h++) {
             const d = Math.floor(h / 24);
@@ -128,8 +148,28 @@ function makeAccount(profile, rnd) {
                 targetDay = d;
                 const [lo, hi] = profile.playsPerDay;
                 dayTarget = lo + rnd() * (hi - lo);
+                sessHours = null;
+                if (CLUMP) {
+                    // 这一天只在一两个时段听，每段 1~3 小时。开始时刻按通勤/晚间曲线抽
+                    const n = 1 + Math.floor(rnd() * 2);
+                    sessHours = new Set();
+                    for (let s = 0; s < n; s++) {
+                        const r = rnd() * DSUM;
+                        let acc2 = 0, start = 0;
+                        for (let k = 0; k < 24; k++) { acc2 += DIURNAL[k]; if (acc2 >= r) { start = k; break; } }
+                        const len = 1 + Math.floor(rnd() * 3);
+                        for (let k = 0; k < len; k++) sessHours.add((start + k) % 24);
+                    }
+                }
             }
-            const clicks = poisson(dayTarget * DIURNAL[h % 24] / DSUM, rnd);
+            let clicks;
+            if (CLUMP) {
+                clicks = sessHours.has(h % 24)
+                    ? poisson(dayTarget / sessHours.size, rnd)
+                    : 0;
+            } else {
+                clicks = poisson(dayTarget * DIURNAL[h % 24] / DSUM, rnd);
+            }
             const m = new Map();
             for (let i = 0; i < clicks; i++) {
                 const it = pick();
@@ -217,10 +257,14 @@ function runAccount(profile, seed) {
         exactRows: [],
         // 按「7 天前那一段到底有没有听」拆开：补偿只在有听的那批行上起作用
         dropPos: 0, dropPosErr: 0, dropPosSigned: 0, dropZero: 0, dropZeroErr: 0,
+        supp: 0, suppObs: 0, // 补偿对不上、按「宁可不给数」藏起来的行
+        flip: 0, flipComp: 0, // 同一天两次观测之间「没听却变了」的显示行
+        leak: 0, // 两张榜里都没有、页面上却还挂着正数的行
+        flipBig: 0, // 其中变化幅度 ≥3 次的（量化漂一格是 ±1，成坨滑出才会更大）
     };
 
     let hour = WARMUP_DAYS * 24 + Math.floor(rnd() * 24); // 随机起始钟点
-    let lastObs = null, lastDay = null, baseHour = null, prevTotal = null;
+    let lastObs = null, lastDay = null, baseHour = null, prevIds = null, prevSame = null;
     // 每天实际是哪一小时看的。滚动窗口下补偿项要跟这两天同一钟点才对得上，
     // 同日重访以后一次为准（days[day] 也是后一次覆盖的）。
     const obsHour = {};
@@ -247,15 +291,33 @@ function runAccount(profile, seed) {
         if (res.warm) { stat.warm++; hour += nextStep(rnd); continue; }
         if (res.exact) { stat.exactObs++; if (baseHour !== null) stat.exactSpan.push(Math.abs((hour - baseHour) - 24)); }
         if (res.scaleMoved) stat.moved++;
-        // 同日重访时悬停用的是 baseGap：要是它退化成 0，文案会写成「跨了 0 天」
-        if (res.gap === 0 && res.baseGap !== 1) stat.badGap++;
-        // 同一天里，后一次观测的增量表比前一次少行 —— 页面上有人的 +n 会凭空消失
-        const nRows = Object.keys(res.counts || {}).length;
-        if (res.gap === 0 && prevTotal !== null && nRows < prevTotal) {
-            stat.shrink++;
-            stat.totalDrop += prevTotal - nRows;
+        // 同日重访时悬停用的是 baseGap：要是它退化成 0，文案会写成「跨了 0 天」。
+        // 只判「不该是 0」—— 中间漏过一天时 baseGap 本来就是 2
+        if (res.gap === 0 && !(res.baseGap >= 1)) stat.badGap++;
+        // 同一天里，后一次观测的增量表比前一次少行 —— 页面上有人的 +n 会凭空消失。
+        // v3.8.2 起有两种消失是合法的：这首已经滑出周榜（这周 0 次），或者补偿
+        // 对不上被主动藏起来。真正的 bug 只剩一种：周榜压根没算出来，补行却没把
+        // 上午已经算好的行留下来 —— 那才是最早期整表覆盖的毛病
+        if (res.gap === 0 && prevIds) {
+            const wkRows = weekDs && weekDs.map ? weekDs.map.size : 0;
+            if (wkRows === 0) {
+                for (const id of prevIds) {
+                    if (id in res.counts) continue;
+                    stat.shrink++;
+                    stat.totalDrop++;
+                }
+            }
         }
-        prevTotal = nRows;
+        prevIds = Object.keys(res.counts || {});
+        if (res.uncertain && res.uncertain.size) { stat.supp += res.uncertain.size; stat.suppObs++; }
+        // 「补行」越界的硬账：今天这两张榜里都没有这首，页面上却还挂着正数 ——
+        // 那只能是同一天重访时从上午那份补回来的旧值。周榜没算出来的那几次不算
+        // （那时候补行是设计内的），所以只在周榜确实拿到行时判
+        if (res.gap === 0 && !res.scaleMoved && !res.coldWeek && weekDs && weekDs.map.size > 0) {
+            for (const [id, n] of Object.entries(res.counts || {})) {
+                if (n > 0 && !weekDs.map.has(id) && !allDs.map.has(id)) stat.leak++;
+            }
+        }
 
         // 真值：从上一次立基线那次观测到现在，这首歌听了几次
         const truth = baseHour === null ? new Map() : acct.sumHours(baseHour + 1, hour);
@@ -267,6 +329,28 @@ function runAccount(profile, seed) {
         const drift = !!(bc && nc && (bc.lo !== nc.lo || bc.hi !== nc.hi));
         const days = P.loadStore().users[uid].days || {};
         const comp = days[P.shiftDay(todayKey, -7)] || {};
+
+        // 同一天两次观测之间，这首歌一次都没再听（真值没动），页面上的数字却变了 ——
+        // 用户就是这么发现问题的：28 分钟里 tyhoon 的 +28 自己掉成 +20。变化的来源
+        // 只可能是标尺重解或者补偿项，两者都不该在「没听」时改动一个数。
+        // 逐行比上一次观测：真值相同而显示不同，记一次 flip
+        if (res.gap === 0 && prevSame) {
+            for (const [id, n] of Object.entries(res.counts || {})) {
+                if (!(id in prevSame.counts)) continue;
+                if (prevSame.counts[id] === n) continue;
+                if ((truth.get(Number(id)) || 0) !== prevSame.truth[id]) continue; // 真听了，变了正常
+                stat.flip++;
+                if (Math.abs(prevSame.counts[id] - n) >= 3) stat.flipBig++;
+                if ((comp[id] || 0) > 0) stat.flipComp++;
+            }
+        }
+        if (res.gap === 0) {
+            const snap = {};
+            for (const id of Object.keys(res.counts || {})) snap[id] = truth.get(Number(id)) || 0;
+            prevSame = { counts: { ...res.counts }, truth: snap };
+        } else {
+            prevSame = null; // 跨天了，基线换了一个，不能跟昨天的数比
+        }
 
         for (const [id, n] of Object.entries(res.counts || {})) {
             const t = truth.get(Number(id)) || 0;
@@ -407,11 +491,18 @@ for (const p of PROFILES) {
     if (we.length) console.log(`    错的那些：距 24 小时 ${pctOf(we, 0.5)}h（中位），${pctOf(we, 0.9)}h（P90）`);
     if (re.length) console.log(`    对的那些：距 24 小时 ${pctOf(re, 0.5)}h（中位），${pctOf(re, 0.9)}h（P90）`);
     console.log(`  标尺被判不可比 ${sum('moved')} 次；同日重访时丢了行 ${sum('shrink')} 次（合计少了 ${sum('totalDrop')} 行）`
-        + `；跨天数写错 ${sum('badGap')} 次`);
+        + `；跨天数写错 ${sum('badGap')} 次；补行越界 ${sum('leak')} 行`);
     if (sum('newIds')) console.log(`  新进榜 ${sum('newIds')} 行，合计虚高 ${sum('newIdOver')} 次`);
+    if (sum('flip')) console.log(`  同一天里「没听却变了」的显示 ${sum('flip')} 行（${sum('flipBig')} 行幅度 ≥3 次，${sum('flipComp')} 行的补偿项非零）`);
+    if (sum('supp')) {
+        const vis = sum('weekRows') + sum('supp');
+        console.log(`  补偿对不上、没出数 ${sum('supp')} 行（占周榜行 ${(100 * sum('supp') / vis).toFixed(1)}%，`
+            + `${sum('suppObs')}/${sum('obs')} 次观测里有行被藏起来）`);
+    }
     if (VERBOSE && errs.length) console.log(`   · 最大误差来自 seed ${list.reduce((a, s) => (s.weekErrMax > a.weekErrMax ? s : a)).seed}`);
     if (sum('allWrong')) fail = 1; // 真值差分永远不该错
     if (sum('shrink') || sum('badGap')) fail = 1; // 同一天重访不该丢行，跨天数也不该是 0
+    if (sum('leak')) fail = 1; // 今天的榜里没有的数，不该还挂在页面上
 }
 
 {
@@ -420,6 +511,11 @@ for (const p of PROFILES) {
     console.log(`\n合计：观测 ${sum('obs')} 次，周榜行 ${sum('weekRows')}`
         + `，平均绝对误差 ${(sum('weekErrSum') / rows).toFixed(2)}`
         + `，声称精确却算错 ${sum('exactWrong')} 行`);
+    if (sum('supp')) {
+        const vis = sum('weekRows') + sum('supp');
+        console.log(`  另有 ${sum('supp')} 行因补偿对不上没出数（占周榜行 ${(100 * sum('supp') / vis).toFixed(1)}%），`
+            + `${sum('suppObs')}/${sum('obs')} 次观测里有行被藏起来`);
+    }
 }
 console.log(fail ? '\n有对不上的地方' : '\n真值差分这条硬账对得上');
 process.exit(fail);

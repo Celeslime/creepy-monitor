@@ -47,14 +47,14 @@ function setup(prevTime, prevWeek) {
 // 3) 同一天第二次没算出周榜：已经算好的行不能被抹掉
 {
     const u = setup('2026-10-24T22:00:00');
-    clock.set('2026-10-25T09:00:00');
+    clock.set('2026-10-25T22:00:00');
     // b 昨天本周是 7 次，7 天前那 2 次今天滑出窗口，所以今天涨了 9-7+2=4 次
     const first = P.applyObservation(u, '2026-10-25', { a: 11, b: 9 }, { a: 101 }, SC);
-    r.ok(first.counts.b === 4, '上午算出 b 涨了 4 次（含滑窗补偿）', first.counts.b);
+    r.ok(first.counts.b === 4, '晚上那次数出 b 涨了 4 次（含滑窗补偿）', first.counts.b);
 
-    clock.set('2026-10-25T15:00:00');
+    clock.set('2026-10-25T23:00:00');
     const second = P.applyObservation(u, '2026-10-25', {}, { a: 103 }, null);
-    r.ok(second.counts.b === 4, '下午周榜整段没算出来，上午那行还在', second.counts.b);
+    r.ok(second.counts.b === 4, '一小时后周榜整段没算出来，前面那行还在', second.counts.b);
     r.ok(u.days['2026-10-25'].b === 4, '落盘的当日增量也没丢', u.days['2026-10-25'].b);
     r.ok(second.counts.a === 3, '全时间那半照常更新成 3', second.counts.a);
 }
@@ -62,9 +62,9 @@ function setup(prevTime, prevWeek) {
 // 4) 同一天第二次算得更小：以新的为准，不取大值 —— 旧值可能是量化出来的假高
 {
     const u = setup('2026-10-24T22:00:00');
-    clock.set('2026-10-25T09:00:00');
+    clock.set('2026-10-25T22:00:00');
     P.applyObservation(u, '2026-10-25', { a: 11, b: 9 }, { a: 101 }, SC);
-    clock.set('2026-10-25T15:00:00');
+    clock.set('2026-10-25T23:00:00');
     const second = P.applyObservation(u, '2026-10-25', { a: 11, b: 8 }, { a: 101 }, SC);
     r.ok(second.counts.b === 3, '后一次算出 3 次，以它为准（不取旧的 4）', second.counts.b);
 }
